@@ -6,8 +6,10 @@ import { AuthScreenLayout } from '@/components/form/auth-screen-layout';
 import { FormButton } from '@/components/form/form-button';
 import { TextField } from '@/components/form/text-field';
 import { ThemedText } from '@/components/themed-text';
-import { Brand } from '@/constants/brand';
 import { Spacing } from '@/constants/theme';
+import { useAuth } from '@/context/auth-context';
+import { loginUser, registerUser } from '@/services/api';
+import { saveAccessToken } from '@/services/auth-storage';
 import {
   minLength,
   passwordsMatch,
@@ -40,14 +42,16 @@ const initialForm: FormState = {
 
 export default function RegisterScreen() {
   const router = useRouter();
+  const { refreshSession } = useAuth();
   const [form, setForm] = useState<FormState>(initialForm);
   const [errors, setErrors] = useState<FormErrors>({});
-  const [submitted, setSubmitted] = useState(false);
+  const [serverError, setServerError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
 
   function setField<K extends keyof FormState>(key: K, value: string) {
     setForm((prev) => ({ ...prev, [key]: value }));
     setErrors((prev) => ({ ...prev, [key]: undefined }));
-    setSubmitted(false);
+    setServerError('');
   }
 
   function validate(): boolean {
@@ -57,8 +61,14 @@ export default function RegisterScreen() {
         (v) => required(v, 'Choose a username'),
         validUsername,
       ]),
-      email: runValidators(form.email, [(v) => required(v, 'Enter your email'), validEmail]),
-      phone: runValidators(form.phone, [(v) => required(v, 'Enter your phone number'), validPhone]),
+      email: runValidators(form.email, [
+        (v) => required(v, 'Enter your email'),
+        validEmail,
+      ]),
+      phone: runValidators(form.phone, [
+        (v) => required(v, 'Enter your phone number'),
+        validPhone,
+      ]),
       password: runValidators(form.password, [
         (v) => required(v, 'Create a password'),
         minLength(8),
@@ -72,14 +82,36 @@ export default function RegisterScreen() {
     return Object.values(nextErrors).every((error) => !error);
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
+    setServerError('');
+
     const isValid = validate();
+
     if (!isValid) {
-      setSubmitted(false);
       return;
     }
-    // No backend yet — this is where a real registration API call will go.
-    setSubmitted(true);
+
+    try {
+      setIsLoading(true);
+
+      await registerUser(form);
+
+      const result = await loginUser({
+        identifier: form.email,
+        password: form.password,
+      });
+
+      await saveAccessToken(result.accessToken);
+      await refreshSession();
+    } catch (error) {
+      setServerError(
+        error instanceof Error
+          ? error.message
+          : 'Registration failed. Please try again.',
+      );
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   return (
@@ -104,6 +136,7 @@ export default function RegisterScreen() {
         autoComplete="name"
         returnKeyType="next"
       />
+
       <TextField
         label="Username"
         value={form.username}
@@ -115,6 +148,7 @@ export default function RegisterScreen() {
         autoComplete="username"
         returnKeyType="next"
       />
+
       <TextField
         label="Email"
         value={form.email}
@@ -127,6 +161,7 @@ export default function RegisterScreen() {
         autoComplete="email"
         returnKeyType="next"
       />
+
       <TextField
         label="Phone number"
         value={form.phone}
@@ -137,6 +172,7 @@ export default function RegisterScreen() {
         autoComplete="tel"
         returnKeyType="next"
       />
+
       <TextField
         label="Password"
         value={form.password}
@@ -147,6 +183,7 @@ export default function RegisterScreen() {
         autoComplete="password-new"
         returnKeyType="next"
       />
+
       <TextField
         label="Confirm password"
         value={form.confirmPassword}
@@ -159,19 +196,22 @@ export default function RegisterScreen() {
         onSubmitEditing={handleSubmit}
       />
 
-      {submitted ? (
-        <ThemedText type="small" style={[styles.successBanner, { color: Brand.teal }]}>
-          Looks good! Account creation isn&apos;t connected to a backend yet, so nothing was saved.
+      {serverError ? (
+        <ThemedText type="small" style={styles.errorBanner}>
+          {serverError}
         </ThemedText>
       ) : null}
 
-      <FormButton label="Create Account" onPress={handleSubmit} />
+      <FormButton
+        label={isLoading ? 'Creating Account...' : 'Create Account'}
+        onPress={handleSubmit}
+      />
     </AuthScreenLayout>
   );
 }
 
 const styles = StyleSheet.create({
-  successBanner: {
+  errorBanner: {
     marginTop: -Spacing.one,
   },
 });

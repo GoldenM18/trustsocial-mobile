@@ -1,25 +1,29 @@
-import { StyleSheet } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { StyleSheet, View } from 'react-native';
 
+import { FormButton } from '@/components/form/form-button';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { MaxContentWidth, Spacing } from '@/constants/theme';
+import { useAuth } from '@/context/auth-context';
 
-/**
- * Placeholder for the signed-in home feed. Real authentication, backend,
- * and feed/discovery features aren't implemented yet — this just keeps
- * the tab navigator functional so it's ready to wire up later.
- */
 export default function HomeScreen() {
+  const { logout } = useAuth();
+
   return (
     <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <ThemedText type="subtitle">Home</ThemedText>
-        <ThemedText type="default" themeColor="textSecondary" style={styles.body}>
-          This is where your connections and conversations will appear once accounts and
-          messaging are wired up.
+      <View style={styles.safeArea}>
+        <ThemedText type="title">Welcome to TrustSocial</ThemedText>
+
+        <ThemedText
+          type="default"
+          themeColor="textSecondary"
+          style={styles.body}>
+          Connect with real people and communicate with confidence.
         </ThemedText>
-      </SafeAreaView>
+
+        <View style={styles.logout}>
+          <FormButton label="Log Out" variant="secondary" onPress={() => void logout()} />
+        </View>
+      </View>
     </ThemedView>
   );
 }
@@ -32,10 +36,18 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     width: '100%',
-    maxWidth: MaxContentWidth,
+    maxWidth: 720,
     alignItems: 'center',
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.six,
-    gap: Spacing.two,
+    paddingHorizontal: 24,
+    paddingTop: 64,
+    gap: 8,
+  },
+  body: {
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  logout: {
+    alignSelf: 'stretch',
+    marginTop: 24,
   },
 });

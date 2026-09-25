@@ -6,59 +6,89 @@ import { AuthScreenLayout } from '@/components/form/auth-screen-layout';
 import { FormButton } from '@/components/form/form-button';
 import { TextField } from '@/components/form/text-field';
 import { ThemedText } from '@/components/themed-text';
-import { Brand } from '@/constants/brand';
 import { Spacing } from '@/constants/theme';
-import { required } from '@/utils/validation';
+import { useAuth } from '@/context/auth-context';
+import { loginUser } from '@/services/api';
+import { saveAccessToken } from '@/services/auth-storage';
+import { minLength, required, runValidators } from '@/utils/validation';
 
 type FormState = {
-  identifier: string; // email or username
+  identifier: string;
   password: string;
 };
 
-type FormErrors = Partial<Record<keyof FormState, string>>;
-
 export default function LoginScreen() {
   const router = useRouter();
-  const [form, setForm] = useState<FormState>({ identifier: '', password: '' });
-  const [errors, setErrors] = useState<FormErrors>({});
-  const [submitted, setSubmitted] = useState(false);
+  const { refreshSession } = useAuth();
+
+  const [form, setForm] = useState<FormState>({
+    identifier: '',
+    password: '',
+  });
+
+  const [errors, setErrors] = useState<
+    Partial<Record<keyof FormState, string>>
+  >({});
+  const [serverError, setServerError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
 
   function setField<K extends keyof FormState>(key: K, value: string) {
     setForm((prev) => ({ ...prev, [key]: value }));
     setErrors((prev) => ({ ...prev, [key]: undefined }));
-    setSubmitted(false);
+    setServerError('');
   }
 
   function validate(): boolean {
-    const nextErrors: FormErrors = {
-      identifier: required(form.identifier, 'Enter your email or username'),
-      password: required(form.password, 'Enter your password'),
+    const nextErrors = {
+      identifier: required(
+        form.identifier,
+        'Enter your email or username',
+      ),
+      password: runValidators(form.password, [
+        (v) => required(v, 'Enter your password'),
+        minLength(8),
+      ]),
     };
+
     setErrors(nextErrors);
+
     return Object.values(nextErrors).every((error) => !error);
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
+    setServerError('');
+
     if (!validate()) {
-      setSubmitted(false);
       return;
     }
-    // No backend yet — this is where a real sign-in API call will go.
-    setSubmitted(true);
-  }
 
-  function handleForgotPassword() {
-    // Password-recovery screen isn't built yet — out of scope for this step.
+    try {
+      setIsLoading(true);
+
+      const result = await loginUser(form);
+      await saveAccessToken(result.accessToken);
+      await refreshSession();
+    } catch (error) {
+      setServerError(
+        error instanceof Error
+          ? error.message
+          : 'Login failed. Please check your credentials.',
+      );
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   return (
     <AuthScreenLayout
-      title="Log in"
-      subtitle="Welcome back to TrustSocial."
+      title="Welcome back"
+      subtitle="Log in to continue to TrustSocial."
       footer={
         <ThemedText type="default" themeColor="textSecondary">
-          Don&apos;t have an account?{' '}
-          <ThemedText type="linkPrimary" onPress={() => router.replace('/register')}>
+          Don't have an account?{' '}
+          <ThemedText
+            type="linkPrimary"
+            onPress={() => router.replace('/register')}>
             Create Account
           </ThemedText>
         </ThemedText>
@@ -70,48 +100,48 @@ export default function LoginScreen() {
         error={errors.identifier}
         autoCapitalize="none"
         autoCorrect={false}
-        keyboardType="email-address"
-        textContentType="username"
         autoComplete="username"
         returnKeyType="next"
       />
+
       <TextField
         label="Password"
         value={form.password}
         onChangeText={(v) => setField('password', v)}
         error={errors.password}
         secureTextEntry
-        textContentType="password"
         autoComplete="password"
         returnKeyType="done"
         onSubmitEditing={handleSubmit}
       />
 
-      <ThemedText
-        type="link"
-        themeColor="textSecondary"
-        onPress={handleForgotPassword}
-        style={styles.forgotPassword}>
-        Forgot Password?
-      </ThemedText>
-
-      {submitted ? (
-        <ThemedText type="small" style={[styles.successBanner, { color: Brand.teal }]}>
-          Credentials look valid! Sign-in isn&apos;t connected to a backend yet.
+      {serverError ? (
+        <ThemedText type="small" style={styles.errorBanner}>
+          {serverError}
         </ThemedText>
       ) : null}
 
-      <FormButton label="Log In" onPress={handleSubmit} />
+      <FormButton
+        label={isLoading ? 'Logging In...' : 'Log In'}
+        onPress={handleSubmit}
+      />
+
+      <ThemedText
+        type="linkPrimary"
+        style={styles.forgotPassword}
+        onPress={() => {}}>
+        Forgot password?
+      </ThemedText>
     </AuthScreenLayout>
   );
 }
 
 const styles = StyleSheet.create({
-  forgotPassword: {
-    alignSelf: 'flex-end',
-    marginTop: -Spacing.two,
-  },
-  successBanner: {
+  errorBanner: {
     marginTop: -Spacing.one,
+  },
+  forgotPassword: {
+    textAlign: 'center',
+    marginTop: Spacing.two,
   },
 });
