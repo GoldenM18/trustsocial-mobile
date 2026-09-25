@@ -1,6 +1,7 @@
 import { io, type Socket } from 'socket.io-client';
 
 import type { Message } from '@/services/api';
+import { parseMessageAttachments, parseMessageReactions, parseMessageReply } from '@/services/api';
 import { getAccessToken } from '@/services/auth-storage';
 
 const SOCKET_URL = 'http://localhost:3000';
@@ -12,6 +13,12 @@ export type MessagesReadEvent = {
   conversationId: string;
   messageIds: string[];
   readBy: string;
+};
+
+export type MessagesDeliveredEvent = {
+  conversationId: string;
+  messageIds: string[];
+  deliveredBy: string;
 };
 
 type PendingAck = {
@@ -34,13 +41,288 @@ type ChatSocketOptions = {
   onUserTyping?: (userId: string) => void;
   onUserStoppedTyping?: (userId: string) => void;
   onMessagesRead?: (event: MessagesReadEvent) => void;
+  onMessagesDelivered?: (event: MessagesDeliveredEvent) => void;
+  onMessageDeletedForEveryone?: (message: Message) => void;
+  onMessageHiddenForMe?: (event: { conversationId: string; messageId: string }) => void;
+  onMessageEdited?: (message: Message) => void;
+  onMessageReactionsUpdated?: (event: MessageReactionsUpdate) => void;
+  onMessageAttachmentAdded?: (message: Message) => void;
+};
+
+export type MessageReactionsUpdate = {
+  messageId: string;
+  reactions: Message['reactions'];
 };
 
 export type ChatSocketHandle = {
-  sendMessage: (conversationId: string, content: string) => Promise<void>;
+  sendMessage: (conversationId: string, content: string, replyToMessageId?: string) => Promise<Message>;
+  deleteMessageForEveryone: (conversationId: string, messageId: string) => Promise<void>;
+  deleteMessageForMe: (conversationId: string, messageId: string) => Promise<void>;
+  editMessage: (messageId: string, content: string) => Promise<void>;
+  setReaction: (messageId: string, reaction: string) => Promise<void>;
+  removeReaction: (messageId: string) => Promise<void>;
   markConversationAsRead: () => Promise<void>;
+  markConversationAsDelivered: (conversationId: string) => Promise<void>;
   disconnect: () => void;
 };
+
+export type InboxSocketHandle = {
+  joinConversations: (conversationIds: string[]) => void;
+  disconnect: () => void;
+};
+
+let sharedSocket: Socket | null = null;
+let sharedConnect: Promise<Socket> | null = null;
+let sharedHolders = 0;
+const inboxRooms = new Set<string>();
+const joinedRooms = new Set<string>();
+const inboxReadListeners = new Set<(event: MessagesReadEvent) => void>();
+const inboxHiddenListeners = new Set<
+  (event: { conversationId: string; messageId: string }) => void
+>();
+
+export function connectInboxSocket(
+  onMessage: (message: Message) => void,
+  onMessagesRead: (event: MessagesReadEvent) => void,
+  onMessageDeletedForEveryone: (message: Message) => void,
+  onMessageHiddenForMe: (event: { conversationId: string; messageId: string }) => void,
+  onMessageEdited: (message: Message) => void,
+  onMessageAttachmentAdded: (message: Message) => void,
+): InboxSocketHandle {
+  let stopped = false;
+  let held = false;
+  let socket: Socket | null = null;
+
+  const deliverRead = (event: MessagesReadEvent) => {
+    if (!stopped) {
+      onMessagesRead(event);
+    }
+  };
+
+  const handleMessage = (payload: unknown) => {
+    const message = parseMessage(payload);
+
+    if (message) {
+      onMessage(message);
+    }
+  };
+
+  const handleMessagesRead = (payload: unknown) => {
+    const event = readMessagesReadEvent(payload);
+
+    if (event) {
+      deliverRead(event);
+    }
+  };
+
+  const handleMessageDeleted = (payload: unknown) => {
+    const message = parseMessage(payload);
+
+    if (message?.deletedForEveryone && !stopped) {
+      onMessageDeletedForEveryone(message);
+    }
+  };
+
+  const handleMessageEdited = (payload: unknown) => {
+    const message = parseMessage(payload);
+
+    if (message && !stopped) {
+      onMessageEdited(message);
+    }
+  };
+
+  const handleMessageAttachmentAdded = (payload: unknown) => {
+    const message = parseMessage(payload);
+
+    if (message && !stopped) {
+      onMessageAttachmentAdded(message);
+    }
+  };
+
+  inboxReadListeners.add(deliverRead);
+  inboxHiddenListeners.add(onMessageHiddenForMe);
+
+  void (async () => {
+    const token = await getAccessToken();
+
+    if (stopped || !token) {
+      return;
+    }
+
+    holdSharedSocket();
+    held = true;
+
+    try {
+      socket = await ensureSharedSocket();
+    } catch {
+      if (held) {
+        held = false;
+        releaseSharedSocket();
+      }
+      return;
+    }
+
+    if (stopped || !socket) {
+      return;
+    }
+
+    socket.on('new_message', handleMessage);
+    socket.on('messages_read', handleMessagesRead);
+    socket.on('message_deleted_for_everyone', handleMessageDeleted);
+    socket.on('message_edited', handleMessageEdited);
+    socket.on('message_attachment_added', handleMessageAttachmentAdded);
+
+    if (socket.connected) {
+      void rejoinInboxRooms(socket);
+    }
+  })();
+
+  return {
+    joinConversations(conversationIds) {
+      for (const conversationId of conversationIds) {
+        if (conversationId) {
+          inboxRooms.add(conversationId);
+        }
+      }
+
+      if (socket?.connected) {
+        void rejoinInboxRooms(socket);
+      }
+    },
+    disconnect() {
+      if (stopped) {
+        return;
+      }
+
+      stopped = true;
+      inboxReadListeners.delete(deliverRead);
+      inboxHiddenListeners.delete(onMessageHiddenForMe);
+      socket?.off('new_message', handleMessage);
+      socket?.off('messages_read', handleMessagesRead);
+      socket?.off('message_deleted_for_everyone', handleMessageDeleted);
+      socket?.off('message_edited', handleMessageEdited);
+      socket?.off('message_attachment_added', handleMessageAttachmentAdded);
+      inboxRooms.clear();
+
+      if (held) {
+        held = false;
+        releaseSharedSocket();
+      }
+    },
+  };
+}
+
+function notifyInboxMarkedRead(conversationId: string) {
+  const event: MessagesReadEvent = {
+    conversationId,
+    messageIds: [],
+    readBy: '',
+  };
+
+  for (const listener of [...inboxReadListeners]) {
+    listener(event);
+  }
+}
+
+function notifyInboxMessageHidden(conversationId: string, messageId: string) {
+  const event = { conversationId, messageId };
+
+  for (const listener of [...inboxHiddenListeners]) {
+    listener(event);
+  }
+}
+
+function holdSharedSocket() {
+  sharedHolders += 1;
+}
+
+function releaseSharedSocket() {
+  sharedHolders = Math.max(0, sharedHolders - 1);
+
+  if (sharedHolders > 0) {
+    return;
+  }
+
+  const current = sharedSocket;
+  sharedSocket = null;
+  sharedConnect = null;
+  inboxRooms.clear();
+  joinedRooms.clear();
+
+  if (!current) {
+    return;
+  }
+
+  current.removeAllListeners();
+  current.io.removeAllListeners();
+  current.disconnect();
+}
+
+function ensureSharedSocket(): Promise<Socket> {
+  if (sharedSocket) {
+    return Promise.resolve(sharedSocket);
+  }
+
+  if (!sharedConnect) {
+    sharedConnect = createSharedSocket();
+  }
+
+  return sharedConnect;
+}
+
+async function createSharedSocket(): Promise<Socket> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  if (sharedSocket) {
+    return sharedSocket;
+  }
+
+  const socket = io(SOCKET_URL, {
+    auth: { token },
+    autoConnect: false,
+    reconnection: true,
+  });
+  sharedSocket = socket;
+  socket.on('connect', () => {
+    void rejoinInboxRooms(socket);
+  });
+  socket.on('disconnect', () => {
+    joinedRooms.clear();
+  });
+  socket.io.on('reconnect_attempt', () => {
+    void refreshAuthToken(socket);
+  });
+  socket.connect();
+  return socket;
+}
+
+async function rejoinInboxRooms(socket: Socket) {
+  for (const conversationId of inboxRooms) {
+    await joinSharedConversation(socket, conversationId);
+  }
+}
+
+function joinSharedConversation(socket: Socket, conversationId: string): Promise<void> {
+  if (!conversationId || joinedRooms.has(conversationId) || !socket.connected) {
+    return Promise.resolve();
+  }
+
+  joinedRooms.add(conversationId);
+
+  return new Promise((resolve) => {
+    socket.emit('join_conversation', { conversationId }, (response: unknown) => {
+      if (isAckError(response)) {
+        joinedRooms.delete(conversationId);
+      }
+
+      resolve();
+    });
+  });
+}
 
 let nextSessionId = 0;
 let activeSessionId = 0;
@@ -56,15 +338,36 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
   let socket: Socket | null = null;
   let closed = false;
   let joined = false;
+  let heldSocket = false;
+  let detachSocketListeners: (() => void) | null = null;
+  let handleSocketConnect: (() => void) | null = null;
   const pendingAcks: PendingAck[] = [];
   const connectedWaiters: ConnectedWaiter[] = [];
 
   const handle: ChatSocketHandle = {
-    sendMessage(conversationId, content) {
-      return sendConversation(conversationId, content);
+    sendMessage(conversationId, content, replyToMessageId) {
+      return sendConversation(conversationId, content, replyToMessageId);
+    },
+    deleteMessageForEveryone(conversationId, messageId) {
+      return deleteMessageForEveryone(conversationId, messageId);
+    },
+    deleteMessageForMe(conversationId, messageId) {
+      return deleteMessageForMe(conversationId, messageId);
+    },
+    editMessage(messageId, content) {
+      return editMessage(messageId, content);
+    },
+    setReaction(messageId, reaction) {
+      return setReaction(messageId, reaction);
+    },
+    removeReaction(messageId) {
+      return removeReaction(messageId);
     },
     markConversationAsRead() {
       return markCurrentConversationAsRead();
+    },
+    markConversationAsDelivered(conversationId) {
+      return markCurrentConversationAsDelivered(conversationId);
     },
     disconnect() {
       closeSession();
@@ -96,21 +399,31 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
     }
 
     options.onStatus('connecting');
+    holdSharedSocket();
+    heldSocket = true;
 
-    const nextSocket = io(SOCKET_URL, {
-      auth: { token },
-      autoConnect: false,
-      reconnection: true,
-    });
+    try {
+      const nextSocket = await ensureSharedSocket();
 
-    if (closed || sessionId !== activeSessionId) {
-      nextSocket.disconnect();
-      return;
+      if (closed || sessionId !== activeSessionId) {
+        return;
+      }
+
+      socket = nextSocket;
+      bindSocket(nextSocket);
+
+      if (nextSocket.connected) {
+        handleSocketConnect?.();
+      }
+    } catch {
+      options.onStatus('offline');
+      options.onConnectionError('Could not connect to chat.');
+
+      if (heldSocket && !closed) {
+        heldSocket = false;
+        releaseSharedSocket();
+      }
     }
-
-    socket = nextSocket;
-    bindSocket(nextSocket);
-    nextSocket.connect();
   }
 
   function bindSocket(current: Socket) {
@@ -176,7 +489,21 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       options.onMessagesRead?.(event);
     };
 
-    current.on('connect', () => {
+    const handleMessagesDelivered = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      const event = readMessagesDeliveredEvent(payload);
+
+      if (!event || event.conversationId !== options.conversationId) {
+        return;
+      }
+
+      options.onMessagesDelivered?.(event);
+    };
+
+    const handleSocketConnected = () => {
       if (!isCurrent(current)) {
         return;
       }
@@ -184,21 +511,32 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       joined = false;
       options.onStatus('connected');
       options.onConnectionError('');
-      current.on('user_online', handleUserOnline);
-      current.on('user_offline', handleUserOffline);
-      current.on('user_typing', handleUserTyping);
-      current.on('user_stopped_typing', handleUserStoppedTyping);
-      current.on('messages_read', handleMessagesRead);
-      resolveConnectedWaiters(current);
-      void joinConversation();
-    });
-
-    current.on('disconnect', (reason) => {
       current.off('user_online', handleUserOnline);
       current.off('user_offline', handleUserOffline);
       current.off('user_typing', handleUserTyping);
       current.off('user_stopped_typing', handleUserStoppedTyping);
       current.off('messages_read', handleMessagesRead);
+      current.off('messages_delivered', handleMessagesDelivered);
+      current.on('user_online', handleUserOnline);
+      current.on('user_offline', handleUserOffline);
+      current.on('user_typing', handleUserTyping);
+      current.on('user_stopped_typing', handleUserStoppedTyping);
+      current.on('messages_read', handleMessagesRead);
+      current.on('messages_delivered', handleMessagesDelivered);
+      resolveConnectedWaiters(current);
+      void joinConversation();
+    };
+    handleSocketConnect = handleSocketConnected;
+
+    current.on('connect', handleSocketConnected);
+
+    const handleDisconnect = (reason: string) => {
+      current.off('user_online', handleUserOnline);
+      current.off('user_offline', handleUserOffline);
+      current.off('user_typing', handleUserTyping);
+      current.off('user_stopped_typing', handleUserStoppedTyping);
+      current.off('messages_read', handleMessagesRead);
+      current.off('messages_delivered', handleMessagesDelivered);
 
       if (!isCurrent(current)) {
         return;
@@ -206,9 +544,9 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
 
       joined = false;
       options.onStatus(reason === 'io client disconnect' ? 'offline' : 'reconnecting');
-    });
+    };
 
-    current.on('connect_error', (error) => {
+    const handleConnectError = (error: Error) => {
       if (!isCurrent(current)) {
         return;
       }
@@ -224,18 +562,18 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
 
       options.onStatus('reconnecting');
       options.onConnectionError('Could not connect to chat.');
-    });
+    };
 
-    current.io.on('reconnect_attempt', () => {
+    const handleReconnectAttempt = () => {
       if (!isCurrent(current)) {
         return;
       }
 
       options.onStatus('reconnecting');
       void refreshAuthToken(current);
-    });
+    };
 
-    current.on('new_message', (payload: unknown) => {
+    const handleNewMessage = (payload: unknown) => {
       if (!isCurrent(current)) {
         return;
       }
@@ -247,9 +585,65 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       }
 
       options.onMessage(message);
-    });
+    };
 
-    current.on('exception', (payload: unknown) => {
+    const handleMessageDeletedForEveryone = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      const message = parseMessage(payload);
+
+      if (!message?.deletedForEveryone || message.conversationId !== options.conversationId) {
+        return;
+      }
+
+      options.onMessageDeletedForEveryone?.(message);
+    };
+
+    const handleMessageEdited = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      const message = parseMessage(payload);
+
+      if (!message || message.deletedForEveryone || message.conversationId !== options.conversationId) {
+        return;
+      }
+
+      options.onMessageEdited?.(message);
+    };
+
+    const handleMessageReactionsUpdated = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      const update = parseReactionUpdate(payload);
+
+      if (!update) {
+        return;
+      }
+
+      options.onMessageReactionsUpdated?.(update);
+    };
+
+    const handleMessageAttachmentAdded = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      const message = parseMessage(payload);
+
+      if (!message || message.conversationId !== options.conversationId) {
+        return;
+      }
+
+      options.onMessageAttachmentAdded?.(message);
+    };
+
+    const handleException = (payload: unknown) => {
       if (!isCurrent(current)) {
         return;
       }
@@ -262,7 +656,36 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       }
 
       options.onConnectionError(publicMessage(payload, 'Chat connection failed.'));
-    });
+    };
+
+    current.on('disconnect', handleDisconnect);
+    current.on('connect_error', handleConnectError);
+    current.io.on('reconnect_attempt', handleReconnectAttempt);
+    current.on('new_message', handleNewMessage);
+    current.on('message_deleted_for_everyone', handleMessageDeletedForEveryone);
+    current.on('message_edited', handleMessageEdited);
+    current.on('message_reactions_updated', handleMessageReactionsUpdated);
+    current.on('message_attachment_added', handleMessageAttachmentAdded);
+    current.on('exception', handleException);
+
+    detachSocketListeners = () => {
+      current.off('connect', handleSocketConnected);
+      current.off('disconnect', handleDisconnect);
+      current.off('connect_error', handleConnectError);
+      current.io.off('reconnect_attempt', handleReconnectAttempt);
+      current.off('new_message', handleNewMessage);
+      current.off('message_deleted_for_everyone', handleMessageDeletedForEveryone);
+      current.off('message_edited', handleMessageEdited);
+      current.off('message_reactions_updated', handleMessageReactionsUpdated);
+      current.off('message_attachment_added', handleMessageAttachmentAdded);
+      current.off('exception', handleException);
+      current.off('user_online', handleUserOnline);
+      current.off('user_offline', handleUserOffline);
+      current.off('user_typing', handleUserTyping);
+      current.off('user_stopped_typing', handleUserStoppedTyping);
+      current.off('messages_read', handleMessagesRead);
+      current.off('messages_delivered', handleMessagesDelivered);
+    };
   }
 
   async function joinConversation() {
@@ -289,15 +712,104 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
     }
   }
 
-  async function sendConversation(conversationId: string, content: string) {
+  async function sendConversation(conversationId: string, content: string, replyToMessageId?: string) {
+    const current = await waitForSocket();
+    await ensureJoined(current, conversationId);
+    const response = await emitWithAck(
+      current,
+      'send_message',
+      replyToMessageId ? { conversationId, content, replyToMessageId } : { conversationId, content },
+      'Could not send message.',
+    );
+    const message = parseMessage(response);
+
+    if (!message || message.conversationId !== conversationId) {
+      throw new Error('Could not send message.');
+    }
+
+    return message;
+  }
+
+  async function deleteMessageForEveryone(conversationId: string, messageId: string) {
+    const current = await waitForSocket();
+    await ensureJoined(current, conversationId);
+    const response = await emitWithAck(
+      current,
+      'delete_message_for_everyone',
+      { conversationId, messageId },
+      'Could not delete message.',
+    );
+    const message = parseMessage(response);
+
+    if (message?.deletedForEveryone && message.conversationId === options.conversationId) {
+      options.onMessageDeletedForEveryone?.(message);
+    }
+  }
+
+  async function deleteMessageForMe(conversationId: string, messageId: string) {
     const current = await waitForSocket();
     await ensureJoined(current, conversationId);
     await emitWithAck(
       current,
-      'send_message',
-      { conversationId, content },
-      'Could not send message.',
+      'delete_message_for_me',
+      { conversationId, messageId },
+      'Could not delete message.',
     );
+    options.onMessageHiddenForMe?.({ conversationId, messageId });
+    notifyInboxMessageHidden(conversationId, messageId);
+  }
+
+  async function editMessage(messageId: string, content: string) {
+    const current = await waitForSocket();
+    await ensureJoined(current, options.conversationId);
+    const response = await emitWithAck(
+      current,
+      'edit_message',
+      { messageId, content },
+      'Could not edit message.',
+    );
+    const message = parseMessage(response);
+
+    if (
+      message &&
+      !message.deletedForEveryone &&
+      message.conversationId === options.conversationId &&
+      message.id === messageId
+    ) {
+      options.onMessageEdited?.(message);
+    }
+  }
+
+  async function setReaction(messageId: string, reaction: string) {
+    const current = await waitForSocket();
+    await ensureJoined(current, options.conversationId);
+    const response = await emitWithAck(
+      current,
+      'add_reaction',
+      { messageId, reaction },
+      'Could not add reaction.',
+    );
+    deliverReactionUpdate(response);
+  }
+
+  async function removeReaction(messageId: string) {
+    const current = await waitForSocket();
+    await ensureJoined(current, options.conversationId);
+    const response = await emitWithAck(
+      current,
+      'remove_reaction',
+      { messageId },
+      'Could not remove reaction.',
+    );
+    deliverReactionUpdate(response);
+  }
+
+  function deliverReactionUpdate(response: unknown) {
+    const update = parseReactionUpdate(response);
+
+    if (update) {
+      options.onMessageReactionsUpdated?.(update);
+    }
   }
 
   async function markCurrentConversationAsRead() {
@@ -318,6 +830,32 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       'mark_as_read',
       { conversationId: options.conversationId },
       'Could not mark messages as read.',
+    );
+    notifyInboxMarkedRead(options.conversationId);
+  }
+
+  async function markCurrentConversationAsDelivered(conversationId: string) {
+    if (conversationId !== options.conversationId) {
+      return;
+    }
+
+    const current = await waitForSocket();
+
+    if (closed || !isCurrent(current) || !current.connected) {
+      throw new Error('Chat is offline.');
+    }
+
+    await ensureJoined(current, options.conversationId);
+
+    if (closed || !joined || !current.connected) {
+      throw new Error('Could not mark messages as delivered.');
+    }
+
+    await emitWithAck(
+      current,
+      'mark_as_delivered',
+      { conversationId },
+      'Could not mark messages as delivered.',
     );
   }
 
@@ -387,9 +925,15 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
   function emitWithAck(
     current: Socket,
     event: string,
-    payload: { conversationId: string; content?: string },
+    payload: {
+      conversationId?: string;
+      content?: string;
+      messageId?: string;
+      reaction?: string;
+      replyToMessageId?: string;
+    },
     fallback: string,
-  ): Promise<void> {
+  ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       let settled = false;
       const pending: PendingAck = {
@@ -409,7 +953,7 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
           return;
         }
 
-        settle(() => resolve());
+        settle(() => resolve(response));
       });
 
       function settle(action: () => void) {
@@ -437,6 +981,9 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
 
     closed = true;
     joined = false;
+    detachSocketListeners?.();
+    detachSocketListeners = null;
+    handleSocketConnect = null;
 
     if (activeDisconnect === closeSession) {
       activeDisconnect = null;
@@ -445,13 +992,11 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
     const offline = new Error('Chat is offline.');
     rejectConnectedWaiters(offline);
 
-    if (!socket) {
-      return;
+    if (heldSocket) {
+      heldSocket = false;
+      releaseSharedSocket();
     }
 
-    socket.removeAllListeners();
-    socket.io.removeAllListeners();
-    socket.disconnect();
     socket = null;
   }
 
@@ -470,6 +1015,30 @@ async function refreshAuthToken(current: Socket) {
   }
 
   current.auth = { token };
+}
+
+function readMessagesDeliveredEvent(payload: unknown): MessagesDeliveredEvent | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const value = payload as Record<string, unknown>;
+
+  if (
+    typeof value.conversationId !== 'string' ||
+    value.conversationId.length === 0 ||
+    typeof value.deliveredBy !== 'string' ||
+    value.deliveredBy.length === 0 ||
+    !isMessageIdList(value.messageIds)
+  ) {
+    return null;
+  }
+
+  return {
+    conversationId: value.conversationId,
+    messageIds: value.messageIds,
+    deliveredBy: value.deliveredBy,
+  };
 }
 
 function readMessagesReadEvent(payload: unknown): MessagesReadEvent | null {
@@ -534,11 +1103,13 @@ function parseMessage(payload: unknown): Message | null {
     return null;
   }
 
+  const deletedForEveryone = value.deletedForEveryone === true;
+
   return {
     id: value.id,
     conversationId: value.conversationId,
     senderId: value.senderId,
-    content: value.content,
+    content: deletedForEveryone ? 'Message deleted' : value.content,
     createdAt:
       value.createdAt instanceof Date ? value.createdAt.toISOString() : value.createdAt,
     readAt:
@@ -547,6 +1118,39 @@ function parseMessage(payload: unknown): Message | null {
         : typeof value.readAt === 'string'
           ? value.readAt
           : null,
+    deliveredAt:
+      value.deliveredAt instanceof Date
+        ? value.deliveredAt.toISOString()
+        : typeof value.deliveredAt === 'string'
+          ? value.deliveredAt
+          : null,
+    editedAt:
+      value.editedAt instanceof Date
+        ? value.editedAt.toISOString()
+        : typeof value.editedAt === 'string'
+          ? value.editedAt
+          : null,
+    deletedForEveryone,
+    reactions: parseMessageReactions(value.reactions),
+    replyTo: parseMessageReply(value.replyTo),
+    attachments: deletedForEveryone ? [] : parseMessageAttachments(value.attachments),
+  };
+}
+
+function parseReactionUpdate(payload: unknown): MessageReactionsUpdate | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const value = payload as { messageId?: unknown; reactions?: unknown };
+
+  if (typeof value.messageId !== 'string' || value.messageId.length === 0) {
+    return null;
+  }
+
+  return {
+    messageId: value.messageId,
+    reactions: parseMessageReactions(value.reactions),
   };
 }
 

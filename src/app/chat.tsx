@@ -1,11 +1,15 @@
 import { Image } from 'expo-image';
+import * as ImagePicker from 'expo-image-picker';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
+  Modal,
   Platform,
+  Pressable,
   StyleSheet,
   TextInput,
   View,
@@ -21,17 +25,33 @@ import { useTheme } from '@/hooks/use-theme';
 import {
   getConversationMessages,
   getPublicProfile,
+  messageImageSource,
+  uploadMessageImage,
   type Message,
+  type MessageAttachment,
   type PublicProfile,
 } from '@/services/api';
+import { getAccessToken } from '@/services/auth-storage';
 import {
   connectChatSocket,
   type ChatSocketHandle,
   type ChatSocketStatus,
+  type MessageReactionsUpdate,
+  type MessagesDeliveredEvent,
   type MessagesReadEvent,
 } from '@/services/socket';
 
 const MESSAGE_MAX_LENGTH = 5000;
+const MESSAGE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const MESSAGE_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const MESSAGE_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '😡'] as const;
+
+type SelectedChatImage = {
+  uri: string;
+  mimeType: string;
+  fileName?: string | null;
+  file?: Blob;
+};
 
 export default function ChatScreen() {
   const params = useLocalSearchParams<{
@@ -45,10 +65,25 @@ export default function ChatScreen() {
   const [profile, setProfile] = useState<PublicProfile | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
+  const [replyToMessageId, setReplyToMessageId] = useState('');
+  const [selectedImage, setSelectedImage] = useState<SelectedChatImage | null>(null);
+  const [pendingAttachmentMessageId, setPendingAttachmentMessageId] = useState('');
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [accessToken, setAccessToken] = useState('');
+  const [previewAttachmentUrl, setPreviewAttachmentUrl] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState('');
   const [sendError, setSendError] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [deletingMessageId, setDeletingMessageId] = useState('');
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [editError, setEditError] = useState('');
+  const [reactionError, setReactionError] = useState('');
+  const [reactionPickerMessageId, setReactionPickerMessageId] = useState('');
+  const [pendingReactionMessageId, setPendingReactionMessageId] = useState('');
   const [socketStatus, setSocketStatus] = useState<ChatSocketStatus>('connecting');
   const [connectionError, setConnectionError] = useState('');
   const [joinError, setJoinError] = useState('');
@@ -63,8 +98,18 @@ export default function ChatScreen() {
   const chatSocketRef = useRef<ChatSocketHandle | null>(null);
   const socketStatusRef = useRef<ChatSocketStatus>('connecting');
   const markedReadConversationRef = useRef('');
+  const markedDeliveredConversationRef = useRef('');
   const trimmedDraft = draft.trim();
-  const canSend = trimmedDraft.length > 0 && !isSending;
+  const canSend = (trimmedDraft.length > 0 || selectedImage !== null) && !isSending && !isUploadingImage;
+  const replyTarget = replyToMessageId
+    ? messages.find((message) => message.id === replyToMessageId) ?? null
+    : null;
+
+  useEffect(() => {
+    void getAccessToken().then((token) => {
+      setAccessToken(token ?? '');
+    });
+  }, []);
 
   useEffect(() => {
     void loadChat();
@@ -119,6 +164,26 @@ export default function ChatScreen() {
       onMessagesRead(event) {
         markMessagesRead(event);
       },
+      onMessagesDelivered(event) {
+        markMessagesDelivered(event);
+      },
+      onMessageDeletedForEveryone(message) {
+        applyDeletedMessage(message);
+      },
+      onMessageHiddenForMe(event) {
+        if (isSameUser(event.conversationId, conversationId)) {
+          hideMessage(event.messageId);
+        }
+      },
+      onMessageEdited(message) {
+        applyEditedMessage(message);
+      },
+      onMessageReactionsUpdated(event) {
+        applyReactionUpdate(event);
+      },
+      onMessageAttachmentAdded(message) {
+        applyMessageAttachments(message);
+      },
     });
     chatSocketRef.current = handle;
 
@@ -153,6 +218,31 @@ export default function ChatScreen() {
     void socket.markConversationAsRead().catch(() => {
       if (markedReadConversationRef.current === conversationId) {
         markedReadConversationRef.current = '';
+      }
+    });
+  }, [conversationId, isLoading, error, socketStatus]);
+
+  useEffect(() => {
+    if (socketStatus !== 'connected') {
+      markedDeliveredConversationRef.current = '';
+      return;
+    }
+
+    if (!conversationId || isLoading || error) {
+      return;
+    }
+
+    const socket = chatSocketRef.current;
+
+    if (!socket || markedDeliveredConversationRef.current === conversationId) {
+      return;
+    }
+
+    markedDeliveredConversationRef.current = conversationId;
+
+    void socket.markConversationAsDelivered(conversationId).catch(() => {
+      if (markedDeliveredConversationRef.current === conversationId) {
+        markedDeliveredConversationRef.current = '';
       }
     });
   }, [conversationId, isLoading, error, socketStatus]);
@@ -241,6 +331,310 @@ export default function ChatScreen() {
     });
   }
 
+  function markMessagesDelivered(event: MessagesDeliveredEvent) {
+    if (!isSameUser(event.conversationId, conversationId) || !Array.isArray(event.messageIds)) {
+      return;
+    }
+
+    const deliveredIds = new Set(event.messageIds);
+
+    if (deliveredIds.size === 0) {
+      return;
+    }
+
+    const deliveredAt = new Date().toISOString();
+
+    setMessages((current) => {
+      let changed = false;
+      const next = current.map((message) => {
+        if (!isSameUser(message.conversationId, conversationId) || !deliveredIds.has(message.id)) {
+          return message;
+        }
+
+        changed = true;
+        return { ...message, deliveredAt };
+      });
+
+      return changed ? next : current;
+    });
+  }
+
+  function applyDeletedMessage(message: Message) {
+    setEditingMessage((current) => (current?.id === message.id ? null : current));
+    setReactionPickerMessageId((current) => (current === message.id ? '' : current));
+    setMessages((current) =>
+      current.map((item) => {
+        if (item.id === message.id) {
+          return {
+            ...item,
+            content: 'Message deleted',
+            deletedForEveryone: true,
+            attachments: [],
+            deliveredAt: message.deliveredAt,
+            readAt: message.readAt,
+            editedAt: message.editedAt ?? item.editedAt,
+          };
+        }
+
+        if (item.replyTo?.messageId === message.id) {
+          return {
+            ...item,
+            replyTo: {
+              ...item.replyTo,
+              content: 'Message deleted',
+              isDeleted: true,
+            },
+          };
+        }
+
+        return item;
+      }),
+    );
+  }
+
+  function hideMessage(messageId: string) {
+    setEditingMessage((current) => (current?.id === messageId ? null : current));
+    setReplyToMessageId((current) => (current === messageId ? '' : current));
+    setMessages((current) =>
+      current
+        .filter((item) => item.id !== messageId)
+        .map((item) =>
+          item.replyTo?.messageId === messageId
+            ? {
+                ...item,
+                replyTo: {
+                  ...item.replyTo,
+                  content: 'Message deleted',
+                  isDeleted: true,
+                },
+              }
+            : item,
+        ),
+    );
+  }
+
+  function applyEditedMessage(message: Message) {
+    setMessages((current) =>
+      current.map((item) => {
+        if (item.id === message.id) {
+          return {
+            ...item,
+            content: message.content,
+            createdAt: item.createdAt,
+            editedAt: message.editedAt,
+            deliveredAt: message.deliveredAt,
+            readAt: message.readAt,
+          };
+        }
+
+        if (item.replyTo?.messageId === message.id && !item.replyTo.isDeleted) {
+          return {
+            ...item,
+            replyTo: {
+              ...item.replyTo,
+              content: message.content,
+            },
+          };
+        }
+
+        return item;
+      }),
+    );
+  }
+
+  function applyMessageAttachments(message: Message) {
+    if (message.deletedForEveryone) {
+      return;
+    }
+
+    setMessages((current) =>
+      current.map((item) => (item.id === message.id ? { ...item, attachments: message.attachments } : item)),
+    );
+  }
+
+  function mergeAttachment(messageId: string, attachment: MessageAttachment) {
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === messageId
+          ? {
+              ...item,
+              attachments: [
+                ...item.attachments.filter((existing) => existing.id !== attachment.id),
+                attachment,
+              ],
+            }
+          : item,
+      ),
+    );
+  }
+
+  function applyReactionUpdate(event: MessageReactionsUpdate) {
+    setMessages((current) =>
+      current.map((item) => (item.id === event.messageId ? { ...item, reactions: event.reactions } : item)),
+    );
+  }
+
+  async function chooseReaction(message: Message, reaction: string) {
+    const socket = chatSocketRef.current;
+
+    if (message.deletedForEveryone || pendingReactionMessageId || !conversationId) {
+      return;
+    }
+
+    if (!socket || socketStatus === 'offline') {
+      setReactionError('Chat is offline.');
+      return;
+    }
+
+    const selected = message.reactions.find((item) => item.reactedByMe)?.reaction;
+    setPendingReactionMessageId(message.id);
+    setReactionError('');
+
+    try {
+      if (selected === reaction) {
+        await socket.removeReaction(message.id);
+      } else {
+        await socket.setReaction(message.id, reaction);
+      }
+
+      setReactionPickerMessageId('');
+    } catch (nextError) {
+      setReactionError(nextError instanceof Error ? nextError.message : 'Could not update reaction.');
+    } finally {
+      setPendingReactionMessageId('');
+    }
+  }
+
+  function requestEdit(message: Message) {
+    if (message.deletedForEveryone) {
+      return;
+    }
+
+    if (!isUploadingImage) {
+      setSelectedImage(null);
+      setPendingAttachmentMessageId('');
+    }
+    setReplyToMessageId('');
+    setEditingMessage(message);
+    setEditDraft(message.content);
+    setEditError('');
+  }
+
+  function requestReply(message: Message) {
+    setEditingMessage(null);
+    setEditDraft('');
+    setEditError('');
+    setReplyToMessageId(message.id);
+  }
+
+  function scrollToMessage(messageId: string) {
+    const index = messages.findIndex((item) => item.id === messageId);
+
+    if (index < 0) {
+      return;
+    }
+
+    listRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
+  }
+
+  function cancelEdit() {
+    setEditingMessage(null);
+    setEditDraft('');
+    setEditError('');
+  }
+
+  async function saveEdit() {
+    const content = editDraft.trim();
+    const message = editingMessage;
+    const socket = chatSocketRef.current;
+
+    if (!message || !conversationId || isSavingEdit) {
+      return;
+    }
+
+    if (content.length === 0) {
+      setEditError('Message content is required.');
+      return;
+    }
+
+    if (content.length > MESSAGE_MAX_LENGTH) {
+      setEditError('Message must be at most 5000 characters.');
+      return;
+    }
+
+    if (!socket || socketStatusRef.current === 'offline') {
+      setEditError('Chat is offline.');
+      return;
+    }
+
+    setIsSavingEdit(true);
+    setEditError('');
+
+    try {
+      await socket.editMessage(message.id, content);
+      setEditingMessage(null);
+      setEditDraft('');
+    } catch (editFailure) {
+      setEditError(editFailure instanceof Error ? editFailure.message : 'Could not edit message.');
+    } finally {
+      setIsSavingEdit(false);
+    }
+  }
+
+  function requestDelete(message: Message) {
+    Alert.alert('Delete message', 'Choose how to delete this message.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete for me', onPress: () => confirmDelete(message, 'me') },
+      {
+        text: 'Delete for everyone',
+        style: 'destructive',
+        onPress: () => confirmDelete(message, 'everyone'),
+      },
+    ]);
+  }
+
+  function confirmDelete(message: Message, scope: 'me' | 'everyone') {
+    Alert.alert(
+      scope === 'me' ? 'Delete for you?' : 'Delete for everyone?',
+      scope === 'me'
+        ? 'This message will be hidden from your chat. The other person will still see it.'
+        : 'This message will show as deleted for both people.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => void performDelete(message, scope),
+        },
+      ],
+    );
+  }
+
+  async function performDelete(message: Message, scope: 'me' | 'everyone') {
+    const socket = chatSocketRef.current;
+
+    if (!socket || !conversationId || deletingMessageId) {
+      return;
+    }
+
+    setDeletingMessageId(message.id);
+    setDeleteError('');
+
+    try {
+      if (scope === 'everyone') {
+        await socket.deleteMessageForEveryone(conversationId, message.id);
+      } else {
+        await socket.deleteMessageForMe(conversationId, message.id);
+      }
+    } catch (deleteFailure) {
+      setDeleteError(
+        deleteFailure instanceof Error ? deleteFailure.message : 'Could not delete message.',
+      );
+    } finally {
+      setDeletingMessageId('');
+    }
+  }
+
   function goBack() {
     if (router.canGoBack()) {
       router.back();
@@ -250,10 +644,91 @@ export default function ChatScreen() {
     router.replace('/connections');
   }
 
+  async function uploadSelectedImage(messageId: string, image: SelectedChatImage) {
+    if (!conversationId) {
+      return;
+    }
+
+    setIsUploadingImage(true);
+    setSendError('');
+
+    try {
+      const attachment = await uploadMessageImage(conversationId, messageId, image);
+      mergeAttachment(messageId, attachment);
+      setSelectedImage(null);
+      setPendingAttachmentMessageId('');
+    } catch (uploadFailure) {
+      setPendingAttachmentMessageId(messageId);
+      setSendError(uploadFailure instanceof Error ? uploadFailure.message : 'Could not upload image.');
+    } finally {
+      setIsUploadingImage(false);
+    }
+  }
+
+  async function pickImage() {
+    if (isUploadingImage || isSending) {
+      return;
+    }
+
+    try {
+      setSendError('');
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+      if (!permission.granted) {
+        setSendError('Photo library access is needed to choose an image.');
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsMultipleSelection: false,
+      });
+
+      if (result.canceled) {
+        return;
+      }
+
+      const asset = result.assets[0];
+
+      if (!asset?.uri || !asset.mimeType || !MESSAGE_IMAGE_MIME_TYPES.has(asset.mimeType)) {
+        setSendError('Only JPEG, PNG, WebP, and GIF images are allowed.');
+        return;
+      }
+
+      if (typeof asset.fileSize === 'number' && asset.fileSize > MESSAGE_IMAGE_MAX_BYTES) {
+        setSendError('Image must be at most 5 MB.');
+        return;
+      }
+
+      setSelectedImage({
+        uri: asset.uri,
+        mimeType: asset.mimeType,
+        fileName: asset.fileName,
+        file: asset.file,
+      });
+    } catch (pickError) {
+      setSendError(pickError instanceof Error ? pickError.message : 'Could not choose an image.');
+    }
+  }
+
+  function cancelSelectedImage() {
+    if (isUploadingImage) {
+      return;
+    }
+
+    setSelectedImage(null);
+    setPendingAttachmentMessageId('');
+  }
+
   async function sendMessage() {
     const content = draft.trim();
+    const image = selectedImage;
 
-    if (!conversationId || sendingRef.current || content.length === 0) {
+    if (!conversationId || sendingRef.current || isUploadingImage) {
+      return;
+    }
+
+    if (content.length === 0 && !image) {
       return;
     }
 
@@ -267,13 +742,25 @@ export default function ChatScreen() {
       return;
     }
 
+    if (pendingAttachmentMessageId && image) {
+      await uploadSelectedImage(pendingAttachmentMessageId, image);
+      return;
+    }
+
     sendingRef.current = true;
     setIsSending(true);
     setSendError('');
 
     try {
-      await chatSocketRef.current.sendMessage(conversationId, content);
+      const created = await chatSocketRef.current.sendMessage(conversationId, content, replyTarget?.id);
+      appendMessage(created);
       setDraft('');
+      setReplyToMessageId('');
+
+      if (image) {
+        setPendingAttachmentMessageId(created.id);
+        await uploadSelectedImage(created.id, image);
+      }
     } catch (sendFailure) {
       setSendError(
         sendFailure instanceof Error ? sendFailure.message : 'Could not send message.',
@@ -362,6 +849,12 @@ export default function ChatScreen() {
           data={messages}
           keyExtractor={(message) => message.id}
           contentContainerStyle={styles.messages}
+          onScrollToIndexFailed={(info) => {
+            listRef.current?.scrollToOffset({
+              offset: Math.max(0, info.averageItemLength * info.index),
+              animated: true,
+            });
+          }}
           onContentSizeChange={() => {
             if (messages.length > 0) {
               listRef.current?.scrollToEnd({ animated: false });
@@ -373,7 +866,31 @@ export default function ChatScreen() {
             </ThemedText>
           }
           renderItem={({ item }) => (
-            <MessageBubble message={item} isMine={isSameUser(item.senderId, user?.userId)} />
+            <MessageBubble
+              message={item}
+              isMine={isSameUser(item.senderId, user?.userId)}
+              deleting={deletingMessageId === item.id}
+              onEdit={
+                isSameUser(item.senderId, user?.userId) && !item.deletedForEveryone
+                  ? requestEdit
+                  : undefined
+              }
+              onDelete={
+                isSameUser(item.senderId, user?.userId) && !item.deletedForEveryone
+                  ? requestDelete
+                  : undefined
+              }
+              onReact={item.deletedForEveryone ? undefined : chooseReaction}
+              pickerOpen={reactionPickerMessageId === item.id}
+              reacting={pendingReactionMessageId === item.id}
+              onTogglePicker={() =>
+                setReactionPickerMessageId((current) => (current === item.id ? '' : item.id))
+              }
+              onReply={requestReply}
+              onQuotePress={scrollToMessage}
+              accessToken={accessToken}
+              onOpenImage={setPreviewAttachmentUrl}
+            />
           )}
         />
       ) : null}
@@ -390,7 +907,102 @@ export default function ChatScreen() {
               {sendError}
             </ThemedText>
           ) : null}
+          {deleteError ? (
+            <ThemedText type="small" style={styles.sendError}>
+              {deleteError}
+            </ThemedText>
+          ) : null}
+          {reactionError ? (
+            <ThemedText type="small" style={styles.sendError}>
+              {reactionError}
+            </ThemedText>
+          ) : null}
+          {editingMessage ? (
+            <>
+              <ThemedText type="small" themeColor="textSecondary">
+                Editing message
+              </ThemedText>
+              {editError ? (
+                <ThemedText type="small" style={styles.sendError}>
+                  {editError}
+                </ThemedText>
+              ) : null}
+              <View style={styles.composerRow}>
+                <TextInput
+                  value={editDraft}
+                  onChangeText={setEditDraft}
+                  placeholder="Edit message..."
+                  placeholderTextColor={theme.textSecondary}
+                  editable={!isSavingEdit}
+                  multiline
+                  maxLength={MESSAGE_MAX_LENGTH}
+                  style={[
+                    styles.input,
+                    {
+                      color: theme.text,
+                      backgroundColor: theme.backgroundElement,
+                    },
+                  ]}
+                />
+                <View style={styles.editActions}>
+                  <FormButton
+                    label="Cancel"
+                    variant="secondary"
+                    disabled={isSavingEdit}
+                    onPress={cancelEdit}
+                  />
+                  <FormButton
+                    label="Save"
+                    loading={isSavingEdit}
+                    disabled={editDraft.trim().length === 0 || isSavingEdit}
+                    onPress={() => void saveEdit()}
+                  />
+                </View>
+              </View>
+            </>
+          ) : (
+          <>
+          {selectedImage ? (
+            <View style={styles.imageComposer}>
+              <Image source={{ uri: selectedImage.uri }} style={styles.imageComposerPreview} contentFit="cover" />
+              <View style={styles.replyComposerText}>
+                <ThemedText type="small">{isUploadingImage ? 'Uploading image...' : 'Image ready to send'}</ThemedText>
+              </View>
+              {isUploadingImage ? <ActivityIndicator color={Brand.teal} /> : null}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel image"
+                disabled={isUploadingImage}
+                onPress={cancelSelectedImage}>
+                <ThemedText type="small">Cancel</ThemedText>
+              </Pressable>
+            </View>
+          ) : null}
+          {replyTarget ? (
+            <View style={styles.replyComposer}>
+              <View style={styles.replyComposerText}>
+                <ThemedText type="small">{replySenderLabel(replyTarget, user?.userId, profile)}</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+                  {replyPreviewText(replyTarget)}
+                </ThemedText>
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel reply"
+                onPress={() => setReplyToMessageId('')}>
+                <ThemedText type="small">Cancel</ThemedText>
+              </Pressable>
+            </View>
+          ) : null}
           <View style={styles.composerRow}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Choose image"
+              disabled={isSending || isUploadingImage}
+              onPress={() => void pickImage()}
+              style={styles.imageButton}>
+              <ThemedText type="small">Image</ThemedText>
+            </Pressable>
             <TextInput
               value={draft}
               onChangeText={setDraft}
@@ -410,42 +1022,269 @@ export default function ChatScreen() {
             <View style={styles.sendButton}>
               <FormButton
                 label="Send"
-                loading={isSending}
+                loading={isSending || isUploadingImage}
                 disabled={!canSend}
                 onPress={() => void sendMessage()}
               />
             </View>
           </View>
+          </>
+          )}
         </View>
       ) : null}
       </KeyboardAvoidingView>
+      <Modal
+        visible={previewAttachmentUrl.length > 0}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPreviewAttachmentUrl('')}>
+        <Pressable style={styles.previewBackdrop} onPress={() => setPreviewAttachmentUrl('')}>
+          {previewAttachmentUrl && accessToken ? (
+            <AuthedChatImage url={previewAttachmentUrl} token={accessToken} large />
+          ) : (
+            <ActivityIndicator color="#ffffff" />
+          )}
+          <ThemedText type="small" style={styles.previewClose}>
+            Close
+          </ThemedText>
+        </Pressable>
+      </Modal>
     </ThemedView>
   );
 }
 
-function MessageBubble({ message, isMine }: { message: Message; isMine: boolean }) {
+function MessageBubble({
+  message,
+  isMine,
+  deleting,
+  onEdit,
+  onDelete,
+  onReact,
+  pickerOpen,
+  reacting,
+  onTogglePicker,
+  onReply,
+  onQuotePress,
+  accessToken,
+  onOpenImage,
+}: {
+  message: Message;
+  isMine: boolean;
+  deleting: boolean;
+  onEdit?: (message: Message) => void;
+  onDelete?: (message: Message) => void;
+  onReact?: (message: Message, reaction: string) => void;
+  pickerOpen: boolean;
+  reacting: boolean;
+  onTogglePicker: () => void;
+  onReply?: (message: Message) => void;
+  onQuotePress?: (messageId: string) => void;
+  accessToken: string;
+  onOpenImage: (url: string) => void;
+}) {
+  const deleted = message.deletedForEveryone;
+  const actionColor = isMine ? styles.mineTime : undefined;
+
   return (
     <View style={[styles.bubbleRow, isMine ? styles.mineRow : styles.theirRow]}>
-      <ThemedView
-        type={isMine ? undefined : 'backgroundElement'}
-        style={[styles.bubble, isMine ? styles.mineBubble : styles.theirBubble]}>
-        <ThemedText type="default" style={isMine ? styles.mineText : undefined}>
-          {message.content}
-        </ThemedText>
-        <ThemedText type="small" style={isMine ? styles.mineTime : undefined} themeColor={isMine ? undefined : 'textSecondary'}>
-          {formatMessageTime(message.createdAt)}
-        </ThemedText>
-        {isMine ? (
+      <View style={styles.bubbleColumn}>
+        <ThemedView
+          type={isMine ? undefined : 'backgroundElement'}
+          style={[styles.bubble, isMine ? styles.mineBubble : styles.theirBubble]}>
+          {!deleted && message.replyTo ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Show replied message"
+              onPress={() => onQuotePress?.(message.replyTo?.messageId ?? '')}
+              style={[styles.quote, isMine ? styles.quoteMine : styles.quoteTheirs]}>
+              <ThemedText type="small" style={isMine ? styles.mineTime : styles.quoteName} numberOfLines={1}>
+                {message.replyTo.senderName}
+              </ThemedText>
+              <ThemedText type="small" numberOfLines={2} style={isMine ? styles.mineText : undefined}>
+                {message.replyTo.isDeleted ? 'Message deleted' : message.replyTo.content.trim() || 'Image'}
+              </ThemedText>
+            </Pressable>
+          ) : null}
+          {!deleted && message.attachments.length > 0 ? (
+            <View style={styles.attachmentList}>
+              {message.attachments.map((attachment) => (
+                <Pressable
+                  key={attachment.id}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open image"
+                  onPress={() => onOpenImage(attachment.url)}>
+                  {accessToken ? (
+                    <AuthedChatImage url={attachment.url} token={accessToken} />
+                  ) : (
+                    <ActivityIndicator color={Brand.teal} />
+                  )}
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
+          {deleted || message.content.trim().length > 0 ? (
           <ThemedText
-            type="small"
-            style={styles.mineTime}
-            accessibilityLabel={message.readAt != null ? 'Read' : 'Sent'}>
-            {message.readAt != null ? '✓✓' : '✓'}
+            type="default"
+            style={[isMine ? styles.mineText : undefined, deleted ? styles.deletedText : undefined]}>
+            {deleted ? 'Message deleted' : message.content}
           </ThemedText>
+          ) : null}
+          <ThemedText type="small" style={actionColor} themeColor={isMine ? undefined : 'textSecondary'}>
+            {formatMessageTime(message.createdAt)}
+          </ThemedText>
+          {message.editedAt && !deleted ? (
+            <ThemedText type="small" style={actionColor} themeColor={isMine ? undefined : 'textSecondary'}>
+              Edited
+            </ThemedText>
+          ) : null}
+          {isMine ? <SentReceipt message={message} /> : null}
+          {onEdit || onDelete || onReact || onReply ? (
+            <View style={styles.messageActions}>
+              {onReply ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={deleting}
+                  onPress={() => onReply(message)}>
+                  <ThemedText type="small" style={actionColor} themeColor={isMine ? undefined : 'textSecondary'}>
+                    Reply
+                  </ThemedText>
+                </Pressable>
+              ) : null}
+              {onReact ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={deleting || reacting}
+                  onPress={onTogglePicker}>
+                  <ThemedText type="small" style={actionColor} themeColor={isMine ? undefined : 'textSecondary'}>
+                    React
+                  </ThemedText>
+                </Pressable>
+              ) : null}
+              {onEdit ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={deleting}
+                  onPress={() => onEdit(message)}>
+                  <ThemedText type="small" style={styles.mineTime}>
+                    Edit
+                  </ThemedText>
+                </Pressable>
+              ) : null}
+              {onDelete ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={deleting}
+                  onPress={() => onDelete(message)}>
+                  <ThemedText type="small" style={styles.mineTime}>
+                    {deleting ? 'Deleting...' : 'Delete'}
+                  </ThemedText>
+                </Pressable>
+              ) : null}
+            </View>
+          ) : null}
+        </ThemedView>
+        {pickerOpen && onReact ? (
+          <View style={styles.reactionPicker}>
+            {MESSAGE_REACTIONS.map((reaction) => (
+              <Pressable
+                key={reaction}
+                accessibilityRole="button"
+                disabled={reacting}
+                onPress={() => onReact(message, reaction)}
+                style={styles.reactionChoice}>
+                <ThemedText type="default">{reaction}</ThemedText>
+              </Pressable>
+            ))}
+          </View>
         ) : null}
-      </ThemedView>
+        {!deleted && message.reactions.length > 0 ? (
+          <View style={styles.reactionChips}>
+            {message.reactions.map((item) => (
+              <Pressable
+                key={item.reaction}
+                accessibilityRole="button"
+                accessibilityState={{ selected: item.reactedByMe }}
+                disabled={!onReact || reacting}
+                onPress={() => onReact?.(message, item.reaction)}
+                style={[styles.reactionChip, item.reactedByMe ? styles.reactionChipSelected : undefined]}>
+                <ThemedText
+                  type="small"
+                  style={item.reactedByMe ? styles.reactionChipSelectedText : styles.reactionChipText}>
+                  {item.reaction} {item.count}
+                </ThemedText>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+      </View>
     </View>
   );
+}
+
+function SentReceipt({ message }: { message: Message }) {
+  const isRead = message.readAt !== null;
+  const isDelivered = message.deliveredAt !== null;
+
+  return (
+    <ThemedText
+      type="small"
+      style={isRead ? styles.mineReadReceipt : styles.mineTime}
+      accessibilityLabel={isRead ? 'Read' : isDelivered ? 'Delivered' : 'Sent'}>
+      {isRead || isDelivered ? '✓✓' : '✓'}
+    </ThemedText>
+  );
+}
+
+function replySenderLabel(
+  message: Message,
+  currentUserId: string | undefined,
+  profile: PublicProfile | null,
+): string {
+  if (isSameUser(message.senderId, currentUserId)) {
+    return 'You';
+  }
+
+  return profile?.fullName.trim() || profile?.username || 'Message';
+}
+
+function AuthedChatImage({ url, token, large = false }: { url: string; token: string; large?: boolean }) {
+  const [isLoading, setIsLoading] = useState(true);
+
+  return (
+    <View style={large ? styles.previewImageFrame : styles.chatImageFrame}>
+      <Image
+        source={messageImageSource(url, token)}
+        style={large ? styles.previewImage : styles.chatImage}
+        contentFit="contain"
+        accessibilityLabel="Message image"
+        onLoadStart={() => setIsLoading(true)}
+        onLoadEnd={() => setIsLoading(false)}
+      />
+      {isLoading ? (
+        <View style={styles.imageLoading}>
+          <ActivityIndicator color={large ? '#ffffff' : Brand.teal} />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function replyPreviewText(message: Message): string {
+  if (message.deletedForEveryone) {
+    return 'Message deleted';
+  }
+
+  const compact = message.content.replace(/\s+/g, ' ').trim();
+
+  if (compact.length === 0 && message.attachments.length > 0) {
+    return 'Image';
+  }
+
+  if (compact.length <= 80) {
+    return compact;
+  }
+
+  return `${compact.slice(0, 80)}…`;
 }
 
 function mergeMessages(history: Message[], current: Message[]): Message[] {
@@ -563,6 +1402,43 @@ const styles = StyleSheet.create({
   bubbleRow: {
     width: '100%',
   },
+  bubbleColumn: {
+    maxWidth: '80%',
+    gap: Spacing.half,
+  },
+  reactionPicker: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.half,
+  },
+  reactionChoice: {
+    minWidth: 36,
+    minHeight: 36,
+    borderRadius: Spacing.two,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Brand.navy,
+  },
+  reactionChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.half,
+  },
+  reactionChip: {
+    borderRadius: Spacing.three,
+    paddingHorizontal: Spacing.two,
+    paddingVertical: Spacing.half,
+    backgroundColor: Brand.navy,
+  },
+  reactionChipSelected: {
+    backgroundColor: Brand.teal,
+  },
+  reactionChipText: {
+    color: '#ffffff',
+  },
+  reactionChipSelectedText: {
+    color: '#ffffff',
+  },
   mineRow: {
     alignItems: 'flex-end',
   },
@@ -582,8 +1458,14 @@ const styles = StyleSheet.create({
   mineText: {
     color: '#ffffff',
   },
+  deletedText: {
+    fontStyle: 'italic',
+  },
   mineTime: {
     color: '#ffffff',
+  },
+  mineReadReceipt: {
+    color: Brand.navy,
   },
   composer: {
     width: '100%',
@@ -610,6 +1492,106 @@ const styles = StyleSheet.create({
   },
   sendButton: {
     width: 96,
+  },
+  editActions: {
+    width: 96,
+    gap: Spacing.two,
+  },
+  messageActions: {
+    flexDirection: 'row',
+    gap: Spacing.three,
+  },
+  quote: {
+    borderLeftWidth: 3,
+    borderRadius: Spacing.two,
+    paddingHorizontal: Spacing.two,
+    paddingVertical: Spacing.half,
+    gap: Spacing.half,
+  },
+  quoteMine: {
+    borderLeftColor: '#ffffff',
+    backgroundColor: 'rgba(29, 53, 87, 0.28)',
+  },
+  quoteTheirs: {
+    borderLeftColor: Brand.teal,
+    backgroundColor: 'rgba(42, 157, 143, 0.16)',
+  },
+  quoteName: {
+    color: Brand.navy,
+  },
+  replyComposer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.two,
+    borderLeftWidth: 3,
+    borderLeftColor: Brand.teal,
+    backgroundColor: 'rgba(42, 157, 143, 0.12)',
+    borderRadius: Spacing.two,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+  },
+  replyComposerText: {
+    flex: 1,
+    gap: Spacing.half,
+  },
+  imageButton: {
+    minHeight: 48,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.two,
+  },
+  imageComposer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.two,
+  },
+  imageComposerPreview: {
+    width: 56,
+    height: 56,
+    borderRadius: Spacing.two,
+  },
+  attachmentList: {
+    gap: Spacing.two,
+  },
+  chatImageFrame: {
+    width: 220,
+    maxWidth: '100%',
+    height: 180,
+    borderRadius: Spacing.two,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(0, 0, 0, 0.08)',
+  },
+  chatImage: {
+    width: '100%',
+    height: '100%',
+  },
+  imageLoading: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  previewBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.88)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: Spacing.four,
+    gap: Spacing.three,
+  },
+  previewImageFrame: {
+    width: '100%',
+    maxWidth: 720,
+    height: '70%',
+  },
+  previewImage: {
+    width: '100%',
+    height: '100%',
+  },
+  previewClose: {
+    color: '#ffffff',
   },
   sendError: {
     color: Brand.danger,

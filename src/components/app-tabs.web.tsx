@@ -30,6 +30,9 @@ export default function AppTabs() {
           <TabTrigger name="connections" href="/connections" asChild>
             <TabButton>Connections</TabButton>
           </TabTrigger>
+          <TabTrigger name="messages" href="/messages" asChild>
+            <TabButton>Messages</TabButton>
+          </TabTrigger>
           <TabTrigger name="profile" href="/profile" asChild>
             <TabButton>Profile</TabButton>
           </TabTrigger>

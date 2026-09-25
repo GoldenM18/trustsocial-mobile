@@ -614,6 +614,175 @@ export type Conversation = {
   updatedAt: string;
 };
 
+export type MessageReaction = {
+  reaction: string;
+  count: number;
+  reactedByMe: boolean;
+};
+
+export type MessageAttachment = {
+  id: string;
+  type: 'image';
+  mimeType: string;
+  originalName: string;
+  url: string;
+  size: number;
+  createdAt: string;
+};
+
+const MESSAGE_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+export function parseMessageAttachments(value: unknown): MessageAttachment[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') {
+      return [];
+    }
+
+    const attachment = item as {
+      id?: unknown;
+      type?: unknown;
+      mimeType?: unknown;
+      originalName?: unknown;
+      url?: unknown;
+      size?: unknown;
+      createdAt?: unknown;
+    };
+
+    if (attachment.type !== 'image' || typeof attachment.id !== 'string' || attachment.id.length === 0) {
+      return [];
+    }
+
+    if (typeof attachment.mimeType !== 'string' || !MESSAGE_IMAGE_MIME_TYPES.has(attachment.mimeType)) {
+      return [];
+    }
+
+    if (typeof attachment.url !== 'string' || attachment.url.length === 0 || attachment.url.includes('..')) {
+      return [];
+    }
+
+    const createdAt =
+      attachment.createdAt instanceof Date
+        ? attachment.createdAt.toISOString()
+        : typeof attachment.createdAt === 'string'
+          ? attachment.createdAt
+          : '';
+
+    if (createdAt.length === 0 || typeof attachment.size !== 'number' || attachment.size < 1) {
+      return [];
+    }
+
+    return [
+      {
+        id: attachment.id,
+        type: 'image' as const,
+        mimeType: attachment.mimeType,
+        originalName: typeof attachment.originalName === 'string' ? attachment.originalName : 'image',
+        url: attachment.url,
+        size: attachment.size,
+        createdAt,
+      },
+    ];
+  });
+}
+
+export function messageImageSource(url: string, token: string): { uri: string; headers: { Authorization: string } } {
+  const uri =
+    url.startsWith('http://') || url.startsWith('https://')
+      ? url
+      : `${API_URL}${url.startsWith('/') ? '' : '/'}${url}`;
+
+  return {
+    uri,
+    headers: { Authorization: `Bearer ${token}` },
+  };
+}
+
+export type MessageReply = {
+  messageId: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  createdAt: string;
+  isDeleted: boolean;
+};
+
+export function parseMessageReply(value: unknown): MessageReply | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const reply = value as {
+    messageId?: unknown;
+    senderId?: unknown;
+    senderName?: unknown;
+    content?: unknown;
+    createdAt?: unknown;
+    isDeleted?: unknown;
+  };
+
+  if (typeof reply.messageId !== 'string' || reply.messageId.length === 0) {
+    return null;
+  }
+
+  if (typeof reply.senderId !== 'string' || reply.senderId.length === 0) {
+    return null;
+  }
+
+  const createdAt =
+    reply.createdAt instanceof Date
+      ? reply.createdAt.toISOString()
+      : typeof reply.createdAt === 'string'
+        ? reply.createdAt
+        : '';
+
+  if (createdAt.length === 0) {
+    return null;
+  }
+
+  const isDeleted = reply.isDeleted === true;
+
+  return {
+    messageId: reply.messageId,
+    senderId: reply.senderId,
+    senderName: typeof reply.senderName === 'string' ? reply.senderName : '',
+    content: isDeleted ? 'Message deleted' : typeof reply.content === 'string' ? reply.content : '',
+    createdAt,
+    isDeleted,
+  };
+}
+
+const MESSAGE_REACTION_SET = new Set(['❤️', '👍', '😂', '😮', '😢', '😡']);
+
+export function parseMessageReactions(value: unknown): MessageReaction[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') {
+      return [];
+    }
+
+    const reaction = (item as { reaction?: unknown }).reaction;
+    const count = (item as { count?: unknown }).count;
+    const reactedByMe = (item as { reactedByMe?: unknown }).reactedByMe === true;
+
+    if (typeof reaction !== 'string' || !MESSAGE_REACTION_SET.has(reaction)) {
+      return [];
+    }
+
+    if (typeof count !== 'number' || !Number.isFinite(count) || count < 1) {
+      return [];
+    }
+
+    return [{ reaction, count, reactedByMe }];
+  });
+}
+
 export type Message = {
   id: string;
   conversationId: string;
@@ -621,6 +790,12 @@ export type Message = {
   content: string;
   createdAt: string;
   readAt: string | null;
+  deliveredAt: string | null;
+  editedAt: string | null;
+  deletedForEveryone: boolean;
+  reactions: MessageReaction[];
+  replyTo: MessageReply | null;
+  attachments: MessageAttachment[];
 };
 
 export type MessageHistory = {
@@ -662,6 +837,100 @@ export async function createConversation(userId: string): Promise<Conversation> 
     participantIds: Array.isArray(result.participantIds) ? result.participantIds : [],
     createdAt: result.createdAt,
     updatedAt: result.updatedAt,
+  };
+}
+
+export type InboxParticipant = {
+  id: string;
+  fullName: string;
+  username: string;
+  profilePhotoUrl: string | null;
+  isVerified: boolean;
+  isOnline: boolean;
+};
+
+export type InboxLastMessage = {
+  id: string;
+  content: string;
+  senderId: string;
+  createdAt: string;
+  deliveredAt: string | null;
+  readAt: string | null;
+};
+
+export type InboxConversation = {
+  conversationId: string;
+  otherParticipant: InboxParticipant;
+  lastMessage: InboxLastMessage | null;
+  unreadCount: number;
+  updatedAt: string;
+};
+
+export async function getConversations(): Promise<{ conversations: InboxConversation[] }> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(`${API_URL}/conversations`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not load conversations',
+    );
+  }
+
+  return {
+    conversations: Array.isArray(result.conversations)
+      ? result.conversations.map(toInboxConversation)
+      : [],
+  };
+}
+
+function toInboxConversation(value: {
+  conversationId?: string;
+  id?: string;
+  user?: InboxParticipant;
+  otherParticipant?: InboxParticipant;
+  lastMessage?: InboxLastMessage | null;
+  unreadCount?: number;
+  updatedAt?: string;
+}): InboxConversation {
+  const participant = value.otherParticipant ?? value.user;
+
+  return {
+    conversationId: value.conversationId || value.id || '',
+    otherParticipant: {
+      id: participant?.id ?? '',
+      fullName: participant?.fullName ?? '',
+      username: participant?.username ?? '',
+      profilePhotoUrl: participant?.profilePhotoUrl ?? null,
+      isVerified: participant?.isVerified === true,
+      isOnline: participant?.isOnline === true,
+    },
+    lastMessage: value.lastMessage
+      ? {
+          id: value.lastMessage.id,
+          content: value.lastMessage.content,
+          senderId: value.lastMessage.senderId,
+          createdAt: value.lastMessage.createdAt,
+          deliveredAt:
+            typeof value.lastMessage.deliveredAt === 'string' ? value.lastMessage.deliveredAt : null,
+          readAt: typeof value.lastMessage.readAt === 'string' ? value.lastMessage.readAt : null,
+        }
+      : null,
+    unreadCount: typeof value.unreadCount === 'number' ? value.unreadCount : 0,
+    updatedAt: value.updatedAt ?? '',
   };
 }
 
@@ -707,9 +976,16 @@ export async function getConversationMessages(
           id: message.id,
           conversationId: message.conversationId,
           senderId: message.senderId,
-          content: message.content,
+          content: message.deletedForEveryone === true ? 'Message deleted' : message.content,
           createdAt: message.createdAt,
           readAt: typeof message.readAt === 'string' ? message.readAt : null,
+          deliveredAt: typeof message.deliveredAt === 'string' ? message.deliveredAt : null,
+          editedAt: typeof message.editedAt === 'string' ? message.editedAt : null,
+          deletedForEveryone: message.deletedForEveryone === true,
+          reactions: parseMessageReactions(message.reactions),
+          replyTo: parseMessageReply(message.replyTo),
+          attachments:
+            message.deletedForEveryone === true ? [] : parseMessageAttachments(message.attachments),
         }))
       : [],
     page: result.page,
@@ -722,6 +998,7 @@ export async function getConversationMessages(
 export async function sendConversationMessage(
   conversationId: string,
   content: string,
+  replyToMessageId?: string,
 ): Promise<Message> {
   const token = await getAccessToken();
 
@@ -737,7 +1014,9 @@ export async function sendConversationMessage(
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(
+      replyToMessageId ? { content, replyToMessageId } : { content },
+    ),
     },
   );
 
@@ -758,5 +1037,71 @@ export async function sendConversationMessage(
     content: result.content,
     createdAt: result.createdAt,
     readAt: typeof result.readAt === 'string' ? result.readAt : null,
+    deliveredAt: typeof result.deliveredAt === 'string' ? result.deliveredAt : null,
+    editedAt: typeof result.editedAt === 'string' ? result.editedAt : null,
+    deletedForEveryone: false,
+    reactions: [],
+    replyTo: parseMessageReply(result.replyTo),
+    attachments: [],
   };
+}
+
+export async function uploadMessageImage(
+  conversationId: string,
+  messageId: string,
+  file: {
+    uri: string;
+    mimeType: string;
+    fileName?: string | null;
+    file?: Blob;
+  },
+): Promise<MessageAttachment> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const formData = new FormData();
+  const extension = file.mimeType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+  const name = file.fileName || `image.${extension}`;
+
+  if (file.file) {
+    formData.append('file', file.file, name);
+  } else {
+    formData.append('file', {
+      uri: file.uri,
+      name,
+      type: file.mimeType,
+    } as unknown as Blob);
+  }
+
+  const response = await fetch(
+    `${API_URL}/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/attachments`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: formData,
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not upload image',
+    );
+  }
+
+  const attachments = parseMessageAttachments([result]);
+
+  if (attachments.length === 0) {
+    throw new Error('Could not upload image');
+  }
+
+  return attachments[0];
 }
