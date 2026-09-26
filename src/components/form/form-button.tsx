@@ -7,6 +7,7 @@ import { useTheme } from '@/hooks/use-theme';
 
 export type FormButtonProps = {
   label: string;
+  accessibilityLabel?: string;
   onPress: (event: GestureResponderEvent) => void;
   variant?: 'primary' | 'secondary';
   disabled?: boolean;
@@ -16,6 +17,7 @@ export type FormButtonProps = {
 /** Shared primary/secondary button style, reused across Welcome, Create Account, and Log In. */
 export function FormButton({
   label,
+  accessibilityLabel,
   onPress,
   variant = 'primary',
   disabled = false,
@@ -27,7 +29,7 @@ export function FormButton({
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={label}
+      accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{ disabled: disabled || loading }}
       disabled={disabled || loading}
       onPress={onPress}

@@ -971,27 +971,85 @@ export async function getConversationMessages(
   }
 
   return {
-    messages: Array.isArray(result.messages)
-      ? result.messages.map((message: Message) => ({
-          id: message.id,
-          conversationId: message.conversationId,
-          senderId: message.senderId,
-          content: message.deletedForEveryone === true ? 'Message deleted' : message.content,
-          createdAt: message.createdAt,
-          readAt: typeof message.readAt === 'string' ? message.readAt : null,
-          deliveredAt: typeof message.deliveredAt === 'string' ? message.deliveredAt : null,
-          editedAt: typeof message.editedAt === 'string' ? message.editedAt : null,
-          deletedForEveryone: message.deletedForEveryone === true,
-          reactions: parseMessageReactions(message.reactions),
-          replyTo: parseMessageReply(message.replyTo),
-          attachments:
-            message.deletedForEveryone === true ? [] : parseMessageAttachments(message.attachments),
-        }))
-      : [],
+    messages: Array.isArray(result.messages) ? result.messages.map(toConversationMessage) : [],
     page: result.page,
     limit: result.limit,
     total: result.total,
     totalPages: result.totalPages,
+  };
+}
+
+export type MessageSearchResult = {
+  items: Message[];
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+};
+
+export async function searchConversationMessages(
+  conversationId: string,
+  query: string,
+  page = 1,
+  limit = 20,
+): Promise<MessageSearchResult> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const params = new URLSearchParams({
+    q: query,
+    page: String(page),
+    limit: String(limit),
+  });
+
+  const response = await fetch(
+    `${API_URL}/conversations/${encodeURIComponent(conversationId)}/messages/search?${params.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not search messages',
+    );
+  }
+
+  return {
+    items: Array.isArray(result.items) ? result.items.map(toConversationMessage) : [],
+    page: typeof result.page === 'number' ? result.page : page,
+    limit: typeof result.limit === 'number' ? result.limit : limit,
+    total: typeof result.total === 'number' ? result.total : 0,
+    totalPages: typeof result.totalPages === 'number' ? result.totalPages : 0,
+  };
+}
+
+function toConversationMessage(message: Message): Message {
+  const deletedForEveryone = message.deletedForEveryone === true;
+
+  return {
+    id: message.id,
+    conversationId: message.conversationId,
+    senderId: message.senderId,
+    content: deletedForEveryone ? 'Message deleted' : message.content,
+    createdAt: message.createdAt,
+    readAt: typeof message.readAt === 'string' ? message.readAt : null,
+    deliveredAt: typeof message.deliveredAt === 'string' ? message.deliveredAt : null,
+    editedAt: typeof message.editedAt === 'string' ? message.editedAt : null,
+    deletedForEveryone,
+    reactions: parseMessageReactions(message.reactions),
+    replyTo: parseMessageReply(message.replyTo),
+    attachments: deletedForEveryone ? [] : parseMessageAttachments(message.attachments),
   };
 }
 
