@@ -217,6 +217,53 @@ export type DiscoverUsersPage = {
   totalPages: number;
 };
 
+export type SuggestedUser = DiscoverUser & {
+  mutualConnections: number;
+};
+
+export type ConnectionSuggestions = {
+  users: SuggestedUser[];
+};
+
+export async function getConnectionSuggestions(): Promise<ConnectionSuggestions> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(`${API_URL}/connections/suggestions`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not load connection suggestions',
+    );
+  }
+
+  return {
+    users: Array.isArray(result.users)
+      ? result.users.map((user: SuggestedUser) => ({
+          id: user.id,
+          fullName: user.fullName,
+          username: user.username,
+          profilePhotoUrl: user.profilePhotoUrl,
+          isVerified: user.isVerified,
+          isOnline: user.isOnline,
+          mutualConnections: Number(user.mutualConnections) || 0,
+        }))
+      : [],
+  };
+}
+
 export async function discoverUsers(params: {
   search?: string;
   page?: number;
@@ -1365,4 +1412,390 @@ function toNotificationTimestamp(value: unknown): string {
 
 function toNotificationId(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+export type PostAuthor = {
+  id: string;
+  fullName: string;
+  username: string;
+  profilePhotoUrl: string | null;
+  isVerified: boolean;
+};
+
+export type Post = {
+  id: string;
+  authorId: string;
+  content: string;
+  imageUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+  author: PostAuthor | null;
+  likeCount: number;
+  commentCount: number;
+};
+
+export type PostCommentAuthor = {
+  id: string;
+  fullName: string;
+  username: string;
+  profilePhotoUrl: string | null;
+  isVerified: boolean;
+};
+
+export type PostComment = {
+  id: string;
+  postId: string;
+  userId: string;
+  content: string;
+  createdAt: string;
+  author: PostCommentAuthor | null;
+};
+
+export type PostsPage = {
+  posts: Post[];
+  page: number;
+  limit: number;
+  total: number;
+  hasMore: boolean;
+};
+
+export async function getPosts(
+  page = 1,
+  limit = 10,
+): Promise<PostsPage> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts?page=${page}&limit=${limit}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not load posts',
+    );
+  }
+
+  return {
+    posts: Array.isArray(result.posts) ? result.posts : [],
+    page: Number(result.page) || page,
+    limit: Number(result.limit) || limit,
+    total: Number(result.total) || 0,
+    hasMore: Boolean(result.hasMore),
+  };
+}
+
+export async function uploadPostImage(
+  uri: string,
+  fileName?: string,
+  mimeType?: string,
+): Promise<string> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const formData = new FormData();
+
+  const name =
+    fileName ||
+    uri.split('/').pop() ||
+    `post-image-${Date.now()}.jpg`;
+
+  const type = mimeType || 'image/jpeg';
+
+  if (typeof window !== 'undefined') {
+    const imageResponse = await fetch(uri);
+
+    if (!imageResponse.ok) {
+      throw new Error('Could not read selected image');
+    }
+
+    const blob = await imageResponse.blob();
+
+    formData.append(
+      'file',
+      new File([blob], name, {
+        type: blob.type || type,
+      }),
+    );
+  } else {
+    formData.append(
+      'file',
+      {
+        uri,
+        name,
+        type,
+      } as any,
+    );
+  }
+
+  const response = await fetch(
+    `${API_URL}/storage/post-image`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: formData,
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not upload image',
+    );
+  }
+
+  if (!result.imageUrl) {
+    throw new Error('Image upload did not return an image URL');
+  }
+
+  return result.imageUrl;
+}
+
+export async function createPost(
+  content: string,
+  imageUrl?: string | null,
+): Promise<Post> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(`${API_URL}/posts`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      content,
+      imageUrl: imageUrl || undefined,
+    }),
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not create post',
+    );
+  }
+
+  return result;
+}
+
+export async function deletePost(postId: string): Promise<void> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/${encodeURIComponent(postId)}/detail`,
+    {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  if (!response.ok) {
+    const result = await response.json();
+
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not delete post',
+    );
+  }
+}
+
+export async function getPost(
+  postId: string,
+): Promise<Post & { liked: boolean }> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/${encodeURIComponent(postId)}/detail`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\\n')
+        : result.message || 'Could not load post',
+    );
+  }
+
+  return result as Post & { liked: boolean };
+}
+
+export async function togglePostLike(postId: string): Promise<{
+  liked: boolean;
+  likeCount: number;
+}> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/${encodeURIComponent(postId)}/detail/like`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not update like',
+    );
+  }
+
+  return {
+    liked: result.liked === true,
+    likeCount: typeof result.likeCount === 'number' ? result.likeCount : 0,
+  };
+}
+
+export async function getPostComments(
+  postId: string,
+): Promise<PostComment[]> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/${encodeURIComponent(postId)}/comments`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not load comments',
+    );
+  }
+
+  return Array.isArray(result) ? result : [];
+}
+
+export async function addPostComment(
+  postId: string,
+  content: string,
+): Promise<PostComment> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/${encodeURIComponent(postId)}/detail/comments`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ content }),
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not add comment',
+    );
+  }
+
+  return result;
+}
+
+export async function deletePostComment(
+  commentId: string,
+): Promise<void> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/posts/comments/${encodeURIComponent(commentId)}`,
+    {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  if (!response.ok) {
+    const result = await response.json();
+
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not delete comment',
+    );
+  }
 }

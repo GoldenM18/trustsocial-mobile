@@ -11,10 +11,12 @@ import { Brand } from '@/constants/brand';
 import { BottomTabInset, Spacing } from '@/constants/theme';
 import {
   discoverUsers,
+  getConnectionSuggestions,
   getOutgoingConnectionRequests,
   sendConnectionRequest,
   type DiscoverUser,
   type DiscoverUsersPage,
+  type SuggestedUser,
 } from '@/services/api';
 
 const PAGE_LIMIT = 20;
@@ -28,6 +30,8 @@ export default function DiscoverScreen() {
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [users, setUsers] = useState<DiscoverUser[]>([]);
+  const [suggestions, setSuggestions] = useState<SuggestedUser[]>([]);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
@@ -100,6 +104,26 @@ export default function DiscoverScreen() {
   useEffect(() => {
     void loadPage(1, debouncedSearch, false);
   }, [debouncedSearch]);
+
+  const loadSuggestions = useCallback(async () => {
+    try {
+      setSuggestionsLoading(true);
+
+      const result = await getConnectionSuggestions();
+      setSuggestions(result.users);
+    } catch (suggestionError) {
+      console.error('Failed to load connection suggestions:', suggestionError);
+      setSuggestions([]);
+    } finally {
+      setSuggestionsLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadSuggestions();
+    }, [loadSuggestions]),
+  );
 
   async function loadPage(nextPage: number, searchValue: string, append: boolean) {
     const seq = ++requestSeq.current;
@@ -233,6 +257,39 @@ export default function DiscoverScreen() {
               returnKeyType="search"
             />
             {isLoading ? <ActivityIndicator color={Brand.teal} /> : null}
+
+            {!debouncedSearch && suggestionsLoading ? (
+              <ActivityIndicator color={Brand.teal} />
+            ) : null}
+
+            {!debouncedSearch && !suggestionsLoading && suggestions.length > 0 ? (
+              <View style={styles.suggestionsSection}>
+                <View style={styles.sectionHeader}>
+                  <ThemedText type="default">Suggested for you</ThemedText>
+                  <ThemedText type="small" themeColor="textSecondary">
+                    Based on your connections
+                  </ThemedText>
+                </View>
+
+                <FlatList
+                  horizontal
+                  data={suggestions}
+                  keyExtractor={(user) => `suggestion-${user.id}`}
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.suggestionsList}
+                  renderItem={({ item }) => (
+                    <SuggestedUserCard
+                      user={item}
+                      isSending={sendingIds[item.id] === true}
+                      isSent={sentIds[item.id] === true}
+                      connectError={connectErrors[item.id] ?? ''}
+                      onConnect={() => void connectToUser(item.id)}
+                    />
+                  )}
+                />
+              </View>
+            ) : null}
+
             {error ? (
               <View style={styles.errorBlock}>
                 <ThemedText type="default" style={styles.error}>
@@ -275,6 +332,86 @@ export default function DiscoverScreen() {
             </View>
           ) : null
         }
+      />
+    </ThemedView>
+  );
+}
+
+function SuggestedUserCard({
+  user,
+  isSending,
+  isSent,
+  connectError,
+  onConnect,
+}: {
+  user: SuggestedUser;
+  isSending: boolean;
+  isSent: boolean;
+  connectError: string;
+  onConnect: () => void;
+}) {
+  const initial = user.fullName.trim().charAt(0).toUpperCase() || 'T';
+
+  return (
+    <ThemedView type="backgroundElement" style={styles.suggestionCard}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`View ${user.fullName} profile`}
+        onPress={() =>
+          router.push({
+            pathname: '/user-profile',
+            params: { id: user.id },
+          })
+        }
+        style={({ pressed }) => [styles.suggestionProfile, pressed && styles.pressed]}>
+        {user.profilePhotoUrl ? (
+          <Image
+            source={{ uri: user.profilePhotoUrl }}
+            style={styles.suggestionPhoto}
+            contentFit="cover"
+            accessibilityLabel={`${user.fullName} profile photo`}
+          />
+        ) : (
+          <ThemedView style={[styles.suggestionPhoto, styles.photoFallback]}>
+            <ThemedText style={styles.photoGlyph}>{initial}</ThemedText>
+          </ThemedView>
+        )}
+
+        <ThemedText
+          type="default"
+          numberOfLines={1}
+          style={styles.suggestionName}>
+          {user.fullName}
+        </ThemedText>
+
+        <ThemedText
+          type="small"
+          themeColor="textSecondary"
+          numberOfLines={1}>
+          @{user.username}
+        </ThemedText>
+
+        <ThemedText
+          type="small"
+          themeColor="textSecondary"
+          style={styles.mutualText}>
+          {user.mutualConnections === 1
+            ? '1 mutual connection'
+            : `${user.mutualConnections} mutual connections`}
+        </ThemedText>
+      </Pressable>
+
+      {connectError ? (
+        <ThemedText type="small" style={styles.connectError} numberOfLines={2}>
+          {connectError}
+        </ThemedText>
+      ) : null}
+
+      <FormButton
+        label={isSent ? 'Request Sent' : 'Connect'}
+        disabled={isSent || isSending}
+        loading={isSending}
+        onPress={onConnect}
       />
     </ThemedView>
   );
@@ -364,6 +501,39 @@ const styles = StyleSheet.create({
   header: {
     gap: Spacing.three,
     marginBottom: Spacing.three,
+  },
+  suggestionsSection: {
+    gap: Spacing.two,
+  },
+  sectionHeader: {
+    gap: Spacing.one,
+  },
+  suggestionsList: {
+    gap: Spacing.three,
+    paddingVertical: Spacing.one,
+  },
+  suggestionCard: {
+    width: 190,
+    borderRadius: Spacing.three,
+    padding: Spacing.three,
+    gap: Spacing.two,
+  },
+  suggestionProfile: {
+    alignItems: 'center',
+    gap: Spacing.one,
+  },
+  suggestionPhoto: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    marginBottom: Spacing.one,
+  },
+  suggestionName: {
+    maxWidth: 160,
+    textAlign: 'center',
+  },
+  mutualText: {
+    textAlign: 'center',
   },
   errorBlock: {
     gap: Spacing.three,
