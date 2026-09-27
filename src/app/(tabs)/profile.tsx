@@ -1,5 +1,6 @@
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
+import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
@@ -217,6 +218,14 @@ export default function ProfileScreen() {
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled">
         <ThemedText type="subtitle">Profile</ThemedText>
+        <View style={styles.actions}>
+          <FormButton
+            label="Notifications"
+            accessibilityLabel="Notifications"
+            variant="secondary"
+            onPress={() => router.push('/notifications')}
+          />
+        </View>
 
         {isLoading ? (
           <ActivityIndicator color={Brand.teal} style={styles.status} />

@@ -16,6 +16,7 @@ import {
   View,
 } from 'react-native';
 
+import { useCallSession } from '@/call/call-session';
 import { FormButton } from '@/components/form/form-button';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -67,6 +68,7 @@ export default function ChatScreen() {
   const userId = firstParam(params.userId);
   const conversationId = firstParam(params.conversationId);
   const { user } = useAuth();
+  const { startOutgoing } = useCallSession();
   const theme = useTheme();
   const [profile, setProfile] = useState<PublicProfile | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -203,6 +205,10 @@ export default function ChatScreen() {
       onMessageAttachmentAdded(message) {
         applyMessageAttachments(message);
       },
+      onCallHistoryUpdated(event) {
+        console.log('[CALL HISTORY] received', event);
+        void loadChat();
+      },
     });
     chatSocketRef.current = handle;
 
@@ -295,6 +301,28 @@ export default function ChatScreen() {
       setIsOtherUserOnline((current) =>
         presenceFromSocketRef.current ? current : nextProfile.isOnline,
       );
+      console.log(
+        '[CHAT HISTORY]',
+        history.messages.map((message) => ({
+          id: message.id,
+          type: message.messageType,
+          status: message.callStatus,
+          duration: message.callDurationSeconds,
+          createdAt: message.createdAt,
+        })),
+      );
+
+      console.log(
+        '[CHAT HISTORY]',
+        history.messages.map((message) => ({
+          id: message.id,
+          type: message.messageType,
+          status: message.callStatus,
+          duration: message.callDurationSeconds,
+          createdAt: message.createdAt,
+        })),
+      );
+
       setMessages((current) => mergeMessages(history.messages, current));
     } catch (loadError) {
       if (seq !== requestSeq.current) {
@@ -991,6 +1019,16 @@ export default function ChatScreen() {
               }}
             />
           ) : null}
+          {conversationId ? (
+            <FormButton
+              label="Call"
+              accessibilityLabel="Start voice call"
+              variant="secondary"
+              onPress={() =>
+                startOutgoing(conversationId, profile?.fullName.trim() || profile?.username || 'Voice call')
+              }
+            />
+          ) : null}
         </View>
         {profile ? (
           <View style={styles.person}>
@@ -1453,7 +1491,28 @@ function MessageBubble({
                 ))}
               </View>
             ) : null}
-            {deleted || message.content.trim().length > 0 ? (
+            {message.messageType === 'call' ? (
+              <View style={styles.callHistoryCard}>
+                <ThemedText
+                  type="default"
+                  style={[styles.callHistoryTitle, isMine ? styles.mineText : undefined]}>
+                  Voice call
+                </ThemedText>
+                <ThemedText
+                  type="small"
+                  style={[styles.callHistoryStatus, isMine ? styles.mineTime : undefined]}>
+                  {message.callStatus === 'completed'
+                    ? `Completed${
+                        message.callDurationSeconds != null
+                          ? ` • ${Math.floor(message.callDurationSeconds / 60)}m ${message.callDurationSeconds % 60}s`
+                          : ''
+                      }`
+                    : message.callStatus === 'rejected'
+                      ? 'Declined'
+                      : 'Missed'}
+                </ThemedText>
+              </View>
+            ) : deleted || message.content.trim().length > 0 ? (
               <ThemedText
                 type="default"
                 style={[isMine ? styles.mineText : undefined, deleted ? styles.deletedText : undefined]}>
@@ -1772,6 +1831,7 @@ const styles = StyleSheet.create({
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexWrap: 'wrap',
     gap: Spacing.two,
   },
   searchPanel: {
@@ -1957,6 +2017,21 @@ const styles = StyleSheet.create({
   theirBubble: {},
   mineText: {
     color: '#ffffff',
+  },
+  callHistoryCard: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    marginVertical: 2,
+  },
+  callHistoryTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  callHistoryStatus: {
+    fontSize: 13,
+    marginTop: 3,
+    opacity: 0.7,
   },
   deletedText: {
     fontStyle: 'italic',

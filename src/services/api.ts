@@ -1,5 +1,5 @@
 import { getAccessToken } from '@/services/auth-storage';
-const API_URL = 'http://localhost:3000';
+const API_URL = 'http://192.168.0.105:3000';
 
 export async function registerUser(data: {
   fullName: string;
@@ -788,6 +788,10 @@ export type Message = {
   conversationId: string;
   senderId: string;
   content: string;
+  messageType: 'text' | 'call';
+  callId: string | null;
+  callStatus: 'completed' | 'rejected' | 'missed' | null;
+  callDurationSeconds: number | null;
   createdAt: string;
   readAt: string | null;
   deliveredAt: string | null;
@@ -1042,6 +1046,10 @@ function toConversationMessage(message: Message): Message {
     conversationId: message.conversationId,
     senderId: message.senderId,
     content: deletedForEveryone ? 'Message deleted' : message.content,
+    messageType: message.messageType ?? 'text',
+    callId: message.callId ?? null,
+    callStatus: message.callStatus ?? null,
+    callDurationSeconds: message.callDurationSeconds ?? null,
     createdAt: message.createdAt,
     readAt: typeof message.readAt === 'string' ? message.readAt : null,
     deliveredAt: typeof message.deliveredAt === 'string' ? message.deliveredAt : null,
@@ -1093,6 +1101,10 @@ export async function sendConversationMessage(
     conversationId: result.conversationId,
     senderId: result.senderId,
     content: result.content,
+    messageType: result.messageType ?? 'text',
+    callId: result.callId ?? null,
+    callStatus: result.callStatus ?? null,
+    callDurationSeconds: result.callDurationSeconds ?? null,
     createdAt: result.createdAt,
     readAt: typeof result.readAt === 'string' ? result.readAt : null,
     deliveredAt: typeof result.deliveredAt === 'string' ? result.deliveredAt : null,
@@ -1162,4 +1174,195 @@ export async function uploadMessageImage(
   }
 
   return attachments[0];
+}
+
+export type Notification = {
+  id: string;
+  recipientId: string;
+  type: string;
+  title: string;
+  message: string;
+  relatedUserId: string | null;
+  relatedConversationId: string | null;
+  relatedMessageId: string | null;
+  isRead: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type NotificationList = {
+  notifications: Notification[];
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+};
+
+export async function getNotifications(page = 1, limit = 20): Promise<NotificationList> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const query = new URLSearchParams({
+    page: String(page),
+    limit: String(limit),
+  });
+
+  const response = await fetch(`${API_URL}/notifications?${query.toString()}`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not load notifications',
+    );
+  }
+
+  return {
+    notifications: Array.isArray(result.notifications)
+      ? result.notifications.flatMap((item: unknown) => {
+          const notification = toNotification(item);
+          return notification ? [notification] : [];
+        })
+      : [],
+    page: typeof result.page === 'number' ? result.page : page,
+    limit: typeof result.limit === 'number' ? result.limit : limit,
+    total: typeof result.total === 'number' ? result.total : 0,
+    totalPages: typeof result.totalPages === 'number' ? result.totalPages : 0,
+  };
+}
+
+export async function markNotificationAsRead(notificationId: string): Promise<Notification> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(
+    `${API_URL}/notifications/${encodeURIComponent(notificationId)}/read`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not mark notification as read',
+    );
+  }
+
+  const notification = toNotification(result);
+
+  if (!notification) {
+    throw new Error('Could not mark notification as read');
+  }
+
+  return notification;
+}
+
+export async function markAllNotificationsAsRead(): Promise<{ updated: number }> {
+  const token = await getAccessToken();
+
+  if (!token) {
+    throw new Error('No authentication token found');
+  }
+
+  const response = await fetch(`${API_URL}/notifications/read-all`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      Array.isArray(result.message)
+        ? result.message.join('\n')
+        : result.message || 'Could not mark notifications as read',
+    );
+  }
+
+  return {
+    updated: typeof result.updated === 'number' ? result.updated : 0,
+  };
+}
+
+function toNotification(value: unknown): Notification | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const notification = value as {
+    id?: unknown;
+    recipientId?: unknown;
+    type?: unknown;
+    title?: unknown;
+    message?: unknown;
+    relatedUserId?: unknown;
+    relatedConversationId?: unknown;
+    relatedMessageId?: unknown;
+    isRead?: unknown;
+    createdAt?: unknown;
+    updatedAt?: unknown;
+  };
+
+  if (typeof notification.id !== 'string' || notification.id.length === 0) {
+    return null;
+  }
+
+  if (typeof notification.recipientId !== 'string' || notification.recipientId.length === 0) {
+    return null;
+  }
+
+  const createdAt = toNotificationTimestamp(notification.createdAt);
+  const updatedAt = toNotificationTimestamp(notification.updatedAt);
+
+  if (createdAt.length === 0 || updatedAt.length === 0) {
+    return null;
+  }
+
+  return {
+    id: notification.id,
+    recipientId: notification.recipientId,
+    type: typeof notification.type === 'string' ? notification.type : '',
+    title: typeof notification.title === 'string' ? notification.title : '',
+    message: typeof notification.message === 'string' ? notification.message : '',
+    relatedUserId: toNotificationId(notification.relatedUserId),
+    relatedConversationId: toNotificationId(notification.relatedConversationId),
+    relatedMessageId: toNotificationId(notification.relatedMessageId),
+    isRead: notification.isRead === true,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function toNotificationTimestamp(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  return typeof value === 'string' ? value : '';
+}
+
+function toNotificationId(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }

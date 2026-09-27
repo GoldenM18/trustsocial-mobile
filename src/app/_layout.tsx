@@ -1,5 +1,6 @@
 import { Stack } from 'expo-router';
 
+import { CallSessionProvider } from '@/call/call-session';
 import { AuthProvider, useAuth } from '@/context/auth-context';
 
 export default function RootLayout() {
@@ -18,6 +19,7 @@ function RootNavigator() {
   }
 
   return (
+    <CallSessionProvider enabled={isAuthenticated}>
     <Stack>
       <Stack.Protected guard={!isAuthenticated}>
         <Stack.Screen
@@ -48,5 +50,6 @@ function RootNavigator() {
         />
       </Stack.Protected>
     </Stack>
+    </CallSessionProvider>
   );
 }

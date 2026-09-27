@@ -1,10 +1,10 @@
 import { io, type Socket } from 'socket.io-client';
 
-import type { Message } from '@/services/api';
+import type { Message, Notification } from '@/services/api';
 import { parseMessageAttachments, parseMessageReactions, parseMessageReply } from '@/services/api';
 import { getAccessToken } from '@/services/auth-storage';
 
-const SOCKET_URL = 'http://localhost:3000';
+const SOCKET_URL = 'http://192.168.0.105:3000';
 const REQUEST_TIMEOUT_MS = 10000;
 
 export type ChatSocketStatus = 'connecting' | 'connected' | 'reconnecting' | 'offline';
@@ -47,6 +47,7 @@ type ChatSocketOptions = {
   onMessageEdited?: (message: Message) => void;
   onMessageReactionsUpdated?: (event: MessageReactionsUpdate) => void;
   onMessageAttachmentAdded?: (message: Message) => void;
+  onCallHistoryUpdated?: (event: { conversationId: string; callId: string }) => void;
 };
 
 export type MessageReactionsUpdate = {
@@ -70,6 +71,21 @@ export type InboxSocketHandle = {
   joinConversations: (conversationIds: string[]) => void;
   disconnect: () => void;
 };
+
+export type NotificationSocketHandle = {
+  disconnect: () => void;
+};
+
+export function mergeNotification(
+  notifications: Notification[],
+  incoming: Notification,
+): Notification[] {
+  if (notifications.some((notification) => notification.id === incoming.id)) {
+    return notifications;
+  }
+
+  return [incoming, ...notifications];
+}
 
 let sharedSocket: Socket | null = null;
 let sharedConnect: Promise<Socket> | null = null;
@@ -210,6 +226,411 @@ export function connectInboxSocket(
       }
     },
   };
+}
+
+export function connectNotificationSocket(
+  onNotification: (notification: Notification) => void,
+): NotificationSocketHandle {
+  let stopped = false;
+  let held = false;
+  let socket: Socket | null = null;
+  let recipientId = '';
+
+  const handleNotification = (payload: unknown) => {
+    const notification = parseNotification(payload, recipientId);
+
+    if (notification && !stopped) {
+      onNotification(notification);
+    }
+  };
+
+  void (async () => {
+    const token = await getAccessToken();
+
+    if (stopped || !token) {
+      return;
+    }
+
+    recipientId = readTokenSubject(token);
+    holdSharedSocket();
+    held = true;
+
+    try {
+      socket = await ensureSharedSocket();
+    } catch {
+      if (held) {
+        held = false;
+        releaseSharedSocket();
+      }
+      return;
+    }
+
+    if (stopped || !socket) {
+      return;
+    }
+
+    socket.on('notification:new', handleNotification);
+  })();
+
+  return {
+    disconnect() {
+      if (stopped) {
+        return;
+      }
+
+      stopped = true;
+      socket?.off('notification:new', handleNotification);
+
+      if (held) {
+        held = false;
+        releaseSharedSocket();
+      }
+    },
+  };
+}
+
+export type CallSessionDescription = {
+  type: 'offer' | 'answer';
+  sdp: string;
+};
+
+export type CallIceCandidate = {
+  candidate: string;
+  sdpMid: string | null;
+  sdpMLineIndex: number | null;
+};
+
+export type IncomingCallEvent = {
+  callId: string;
+  conversationId: string;
+  callerId: string;
+};
+
+export type CallAcceptedEvent = {
+  callId: string;
+  conversationId: string;
+  acceptedBy: string;
+};
+
+export type CallRejectedEvent = {
+  callId: string;
+  conversationId: string;
+  rejectedBy: string;
+};
+
+export type CallEndedEvent = {
+  callId: string;
+  conversationId: string;
+  endedBy: string;
+};
+
+export type CallOfferEvent = {
+  callId: string;
+  sdp: CallSessionDescription;
+};
+
+export type CallAnswerEvent = {
+  callId: string;
+  sdp: CallSessionDescription;
+};
+
+export type CallIceCandidateEvent = {
+  callId: string;
+  candidate: CallIceCandidate;
+};
+
+export type CallSocketListeners = {
+  onIncoming?: (event: IncomingCallEvent) => void;
+  onAccepted?: (event: CallAcceptedEvent) => void;
+  onRejected?: (event: CallRejectedEvent) => void;
+  onEnded?: (event: CallEndedEvent) => void;
+  onOffer?: (event: CallOfferEvent) => void;
+  onAnswer?: (event: CallAnswerEvent) => void;
+  onIceCandidate?: (event: CallIceCandidateEvent) => void;
+};
+
+export type CallSocketHandle = {
+  invite: (conversationId: string) => Promise<{ callId: string; conversationId: string }>;
+  accept: (callId: string) => Promise<{ callId: string }>;
+  reject: (callId: string) => Promise<{ callId: string }>;
+  end: (callId: string) => Promise<{ callId: string }>;
+  offer: (callId: string, sdp: CallSessionDescription) => Promise<{ callId: string }>;
+  answer: (callId: string, sdp: CallSessionDescription) => Promise<{ callId: string }>;
+  iceCandidate: (callId: string, candidate: CallIceCandidate) => Promise<{ callId: string }>;
+  disconnect: () => void;
+};
+
+export function connectCallSocket(listeners: CallSocketListeners): CallSocketHandle {
+  let stopped = false;
+  let held = false;
+  let socket: Socket | null = null;
+  const pending: PendingAck[] = [];
+
+  const handleIncoming = (payload: unknown) => {
+    const event = readIncomingCall(payload);
+
+    if (event && !stopped) {
+      listeners.onIncoming?.(event);
+    }
+  };
+
+  const handleAccepted = (payload: unknown) => {
+    const event = readCallAccepted(payload);
+
+    if (event && !stopped) {
+      listeners.onAccepted?.(event);
+    }
+  };
+
+  const handleRejected = (payload: unknown) => {
+    const event = readCallRejected(payload);
+
+    if (event && !stopped) {
+      listeners.onRejected?.(event);
+    }
+  };
+
+  const handleEnded = (payload: unknown) => {
+    const event = readCallEnded(payload);
+
+    if (event && !stopped) {
+      listeners.onEnded?.(event);
+    }
+  };
+
+  const handleOffer = (payload: unknown) => {
+    const event = readCallOffer(payload);
+
+    if (event && !stopped) {
+      listeners.onOffer?.(event);
+    }
+  };
+
+  const handleAnswer = (payload: unknown) => {
+    const event = readCallAnswer(payload);
+
+    if (event && !stopped) {
+      listeners.onAnswer?.(event);
+    }
+  };
+
+  const handleIceCandidate = (payload: unknown) => {
+    const event = readCallIceCandidate(payload);
+
+    if (event && !stopped) {
+      listeners.onIceCandidate?.(event);
+    }
+  };
+
+  const handleException = (payload: unknown) => {
+    const next = pending.shift();
+
+    if (next) {
+      next.reject(new Error(publicMessage(payload, 'Call request failed.')));
+    }
+  };
+
+  const ready = openCallSocket();
+
+  return {
+    invite(conversationId) {
+      return emitCall('call:invite', { conversationId }, 'Unable to start call').then(readInviteAck);
+    },
+    accept(callId) {
+      return emitCall('call:accept', { callId }, 'Unable to accept call').then((response) =>
+        readCallIdAck(response, 'Unable to accept call'),
+      );
+    },
+    reject(callId) {
+      return emitCall('call:reject', { callId }, 'Unable to reject call').then((response) =>
+        readCallIdAck(response, 'Unable to reject call'),
+      );
+    },
+    end(callId) {
+      return emitCall('call:end', { callId }, 'Unable to end call').then((response) =>
+        readCallIdAck(response, 'Unable to end call'),
+      );
+    },
+    offer(callId, sdp) {
+      return emitCall('call:offer', { callId, sdp }, 'Unable to send offer').then((response) =>
+        readCallIdAck(response, 'Unable to send offer'),
+      );
+    },
+    answer(callId, sdp) {
+      return emitCall('call:answer', { callId, sdp }, 'Unable to send answer').then((response) =>
+        readCallIdAck(response, 'Unable to send answer'),
+      );
+    },
+    iceCandidate(callId, candidate) {
+      return emitCall('call:ice-candidate', { callId, candidate }, 'Unable to send ICE candidate').then(
+        (response) => readCallIdAck(response, 'Unable to send ICE candidate'),
+      );
+    },
+    disconnect() {
+      closeCallSocket();
+    },
+  };
+
+  async function openCallSocket(): Promise<Socket> {
+    const token = await getAccessToken();
+
+    if (stopped || !token) {
+      throw new Error('Call signaling is offline.');
+    }
+
+    holdSharedSocket();
+    held = true;
+
+    try {
+      const current = await ensureSharedSocket();
+
+      if (stopped) {
+        throw new Error('Call signaling is offline.');
+      }
+
+      socket = current;
+      current.on('call:incoming', handleIncoming);
+      current.on('call:accepted', handleAccepted);
+      current.on('call:rejected', handleRejected);
+      current.on('call:ended', handleEnded);
+      current.on('call:offer', handleOffer);
+      current.on('call:answer', handleAnswer);
+      current.on('call:ice-candidate', handleIceCandidate);
+      current.on('exception', handleException);
+      await waitUntilCallConnected(current);
+
+      if (stopped) {
+        throw new Error('Call signaling is offline.');
+      }
+
+      return current;
+    } catch (error) {
+      detachCallListeners();
+
+      if (held && !stopped) {
+        held = false;
+        releaseSharedSocket();
+      }
+
+      throw error instanceof Error ? error : new Error('Call signaling is offline.');
+    }
+  }
+
+  function waitUntilCallConnected(current: Socket): Promise<void> {
+    if (current.connected) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Call signaling is offline.'));
+      }, REQUEST_TIMEOUT_MS);
+
+      const onConnect = () => {
+        cleanup();
+        resolve();
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error('Call signaling is offline.'));
+      };
+
+      function cleanup() {
+        clearTimeout(timer);
+        current.off('connect', onConnect);
+        current.off('connect_error', onError);
+      }
+
+      current.on('connect', onConnect);
+      current.on('connect_error', onError);
+    });
+  }
+
+  async function emitCall(
+    event: string,
+    payload: {
+      conversationId?: string;
+      callId?: string;
+      sdp?: CallSessionDescription;
+      candidate?: CallIceCandidate;
+    },
+    fallback: string,
+  ): Promise<unknown> {
+    const current = await ready;
+
+    if (stopped || !current.connected) {
+      throw new Error('Call signaling is offline.');
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const item: PendingAck = {
+        reject(error) {
+          settle(() => reject(error));
+        },
+      };
+      const timer = setTimeout(() => {
+        settle(() => reject(new Error(fallback)));
+      }, REQUEST_TIMEOUT_MS);
+
+      pending.push(item);
+      current.emit(event, payload, (response: unknown) => {
+        if (isAckError(response)) {
+          settle(() => reject(new Error(publicMessage(response, fallback))));
+          return;
+        }
+
+        settle(() => resolve(response));
+      });
+
+      function settle(action: () => void) {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        const index = pending.indexOf(item);
+
+        if (index >= 0) {
+          pending.splice(index, 1);
+        }
+
+        action();
+      }
+    });
+  }
+
+  function closeCallSocket() {
+    if (stopped) {
+      return;
+    }
+
+    stopped = true;
+    detachCallListeners();
+
+    if (held) {
+      held = false;
+      releaseSharedSocket();
+    }
+
+    const offline = new Error('Call signaling is offline.');
+    pending.splice(0).forEach((item) => item.reject(offline));
+    socket = null;
+  }
+
+  function detachCallListeners() {
+    socket?.off('call:incoming', handleIncoming);
+    socket?.off('call:accepted', handleAccepted);
+    socket?.off('call:rejected', handleRejected);
+    socket?.off('call:ended', handleEnded);
+    socket?.off('call:offer', handleOffer);
+    socket?.off('call:answer', handleAnswer);
+    socket?.off('call:ice-candidate', handleIceCandidate);
+    socket?.off('exception', handleException);
+  }
 }
 
 function notifyInboxMarkedRead(conversationId: string) {
@@ -415,9 +836,10 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       if (nextSocket.connected) {
         handleSocketConnect?.();
       }
-    } catch {
+    } catch (error) {
       options.onStatus('offline');
-      options.onConnectionError('Could not connect to chat.');
+      const message = error instanceof Error ? error.message : 'Unknown connection error';
+      options.onConnectionError(`Could not connect to chat: ${message}`);
 
       if (heldSocket && !closed) {
         heldSocket = false;
@@ -561,7 +983,7 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       }
 
       options.onStatus('reconnecting');
-      options.onConnectionError('Could not connect to chat.');
+      options.onConnectionError(`Could not connect to chat: ${error.message}`);
     };
 
     const handleReconnectAttempt = () => {
@@ -643,6 +1065,30 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       options.onMessageAttachmentAdded?.(message);
     };
 
+    const handleCallHistoryUpdated = (payload: unknown) => {
+      if (!isCurrent(current)) {
+        return;
+      }
+
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
+
+      const value = payload as Record<string, unknown>;
+      const conversationId =
+        typeof value.conversationId === 'string' ? value.conversationId : '';
+      const callId = typeof value.callId === 'string' ? value.callId : '';
+
+      if (!conversationId || conversationId !== options.conversationId || !callId) {
+        return;
+      }
+
+      options.onCallHistoryUpdated?.({
+        conversationId,
+        callId,
+      });
+    };
+
     const handleException = (payload: unknown) => {
       if (!isCurrent(current)) {
         return;
@@ -666,6 +1112,7 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
     current.on('message_edited', handleMessageEdited);
     current.on('message_reactions_updated', handleMessageReactionsUpdated);
     current.on('message_attachment_added', handleMessageAttachmentAdded);
+    current.on('call_history_updated', handleCallHistoryUpdated);
     current.on('exception', handleException);
 
     detachSocketListeners = () => {
@@ -678,6 +1125,7 @@ export function connectChatSocket(options: ChatSocketOptions): ChatSocketHandle 
       current.off('message_edited', handleMessageEdited);
       current.off('message_reactions_updated', handleMessageReactionsUpdated);
       current.off('message_attachment_added', handleMessageAttachmentAdded);
+      current.off('call_history_updated', handleCallHistoryUpdated);
       current.off('exception', handleException);
       current.off('user_online', handleUserOnline);
       current.off('user_offline', handleUserOffline);
@@ -1086,6 +1534,246 @@ function readPresenceUserId(payload: unknown): string | null {
   return userId;
 }
 
+function parseNotification(payload: unknown, signedInUserId: string): Notification | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const value = payload as Record<string, unknown>;
+  const createdAt = readTimestamp(value.createdAt);
+  const updatedAt = readTimestamp(value.updatedAt) || createdAt;
+  const recipientId =
+    typeof value.recipientId === 'string' && value.recipientId.length > 0
+      ? value.recipientId
+      : signedInUserId;
+
+  if (
+    typeof value.id !== 'string' ||
+    value.id.length === 0 ||
+    recipientId.length === 0 ||
+    typeof value.type !== 'string' ||
+    typeof value.title !== 'string' ||
+    typeof value.message !== 'string' ||
+    typeof value.isRead !== 'boolean' ||
+    createdAt.length === 0
+  ) {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    recipientId,
+    type: value.type,
+    title: value.title,
+    message: value.message,
+    relatedUserId: readOptionalId(value.relatedUserId),
+    relatedConversationId: readOptionalId(value.relatedConversationId),
+    relatedMessageId: readOptionalId(value.relatedMessageId),
+    isRead: value.isRead,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function readTimestamp(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  return typeof value === 'string' ? value : '';
+}
+
+function readOptionalId(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function readTokenSubject(token: string): string {
+  const segment = token.split('.')[1];
+
+  if (!segment) {
+    return '';
+  }
+
+  try {
+    const padded = segment.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(segment.length / 4) * 4, '=');
+    const payload = JSON.parse(atob(padded)) as { sub?: unknown };
+
+    return typeof payload.sub === 'string' ? payload.sub : '';
+  } catch {
+    return '';
+  }
+}
+
+function readIncomingCall(payload: unknown): IncomingCallEvent | null {
+  const value = readCallRecord(payload);
+
+  if (!value || !isCallId(value.callId) || !isCallId(value.conversationId) || !isCallId(value.callerId)) {
+    return null;
+  }
+
+  return {
+    callId: value.callId,
+    conversationId: value.conversationId,
+    callerId: value.callerId,
+  };
+}
+
+function readCallAccepted(payload: unknown): CallAcceptedEvent | null {
+  const value = readCallRecord(payload);
+
+  if (!value || !isCallId(value.callId) || !isCallId(value.conversationId) || !isCallId(value.acceptedBy)) {
+    return null;
+  }
+
+  return {
+    callId: value.callId,
+    conversationId: value.conversationId,
+    acceptedBy: value.acceptedBy,
+  };
+}
+
+function readCallRejected(payload: unknown): CallRejectedEvent | null {
+  const value = readCallRecord(payload);
+
+  if (!value || !isCallId(value.callId) || !isCallId(value.conversationId) || !isCallId(value.rejectedBy)) {
+    return null;
+  }
+
+  return {
+    callId: value.callId,
+    conversationId: value.conversationId,
+    rejectedBy: value.rejectedBy,
+  };
+}
+
+function readCallEnded(payload: unknown): CallEndedEvent | null {
+  const value = readCallRecord(payload);
+
+  if (!value || !isCallId(value.callId) || !isCallId(value.conversationId) || !isCallId(value.endedBy)) {
+    return null;
+  }
+
+  return {
+    callId: value.callId,
+    conversationId: value.conversationId,
+    endedBy: value.endedBy,
+  };
+}
+
+function readCallOffer(payload: unknown): CallOfferEvent | null {
+  return readCallDescription(payload, 'offer');
+}
+
+function readCallAnswer(payload: unknown): CallAnswerEvent | null {
+  return readCallDescription(payload, 'answer');
+}
+
+function readCallDescription(payload: unknown, type: 'offer' | 'answer'): CallOfferEvent | null {
+  const value = readCallRecord(payload);
+  const sdp = readCallSessionDescription(value?.sdp, type);
+
+  if (!value || !isCallId(value.callId) || !sdp) {
+    return null;
+  }
+
+  return { callId: value.callId, sdp };
+}
+
+function readCallIceCandidate(payload: unknown): CallIceCandidateEvent | null {
+  const value = readCallRecord(payload);
+  const candidate = readCallIce(value?.candidate);
+
+  if (!value || !isCallId(value.callId) || !candidate) {
+    return null;
+  }
+
+  return { callId: value.callId, candidate };
+}
+
+function readCallRecord(payload: unknown): Record<string, unknown> | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  return payload as Record<string, unknown>;
+}
+
+function readCallSessionDescription(value: unknown, type: 'offer' | 'answer'): CallSessionDescription | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const description = value as { type?: unknown; sdp?: unknown };
+
+  if (description.type !== type || typeof description.sdp !== 'string' || description.sdp.length === 0) {
+    return null;
+  }
+
+  return { type, sdp: description.sdp };
+}
+
+function readCallIce(value: unknown): CallIceCandidate | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const candidate = value as {
+    candidate?: unknown;
+    sdpMid?: unknown;
+    sdpMLineIndex?: unknown;
+  };
+
+  if (typeof candidate.candidate !== 'string') {
+    return null;
+  }
+
+  const sdpMid = candidate.sdpMid ?? null;
+  const sdpMLineIndex = candidate.sdpMLineIndex ?? null;
+
+  if (sdpMid !== null && typeof sdpMid !== 'string') {
+    return null;
+  }
+
+  if (
+    sdpMLineIndex !== null &&
+    (typeof sdpMLineIndex !== 'number' || !Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0)
+  ) {
+    return null;
+  }
+
+  return {
+    candidate: candidate.candidate,
+    sdpMid,
+    sdpMLineIndex,
+  };
+}
+
+function readInviteAck(payload: unknown): { callId: string; conversationId: string } {
+  const call = readCallIdAck(payload, 'Unable to start call');
+  const conversationId =
+    payload && typeof payload === 'object' ? (payload as { conversationId?: unknown }).conversationId : undefined;
+
+  if (typeof conversationId !== 'string' || conversationId.length === 0) {
+    throw new Error('Unable to start call');
+  }
+
+  return { callId: call.callId, conversationId };
+}
+
+function readCallIdAck(payload: unknown, fallback: string): { callId: string } {
+  const callId = payload && typeof payload === 'object' ? (payload as { callId?: unknown }).callId : undefined;
+
+  if (typeof callId !== 'string' || callId.length === 0) {
+    throw new Error(fallback);
+  }
+
+  return { callId };
+}
+
+function isCallId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
 function parseMessage(payload: unknown): Message | null {
   if (!payload || typeof payload !== 'object') {
     return null;
@@ -1110,6 +1798,18 @@ function parseMessage(payload: unknown): Message | null {
     conversationId: value.conversationId,
     senderId: value.senderId,
     content: deletedForEveryone ? 'Message deleted' : value.content,
+    messageType: value.messageType === 'call' ? 'call' : 'text',
+    callId: typeof value.callId === 'string' ? value.callId : null,
+    callStatus:
+      value.callStatus === 'completed' ||
+      value.callStatus === 'rejected' ||
+      value.callStatus === 'missed'
+        ? value.callStatus
+        : null,
+    callDurationSeconds:
+      typeof value.callDurationSeconds === 'number'
+        ? value.callDurationSeconds
+        : null,
     createdAt:
       value.createdAt instanceof Date ? value.createdAt.toISOString() : value.createdAt,
     readAt:
